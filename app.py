@@ -53,8 +53,7 @@ UPLOAD_MIME_TYPES: dict[str, frozenset[str]] = {
 }
 
 # Runtime state
-scan_lock = threading.Lock()
-print_lock = threading.Lock()
+command_lock = threading.Lock()
 last_scan: dict[str, str] | None = None
 
 
@@ -506,7 +505,7 @@ HOME_BODY = """
     </label>
   </div>
   <button type="submit" {% if busy %}disabled{% endif %}>
-    {% if busy %}Сканер зайнятий{% else %}Сканувати{% endif %}
+    {% if busy %}Сканер або принтер зайнятий{% else %}Сканувати{% endif %}
   </button>
   <p class="scan-status" id="scan-status" aria-live="polite"></p>
 </form>
@@ -538,7 +537,7 @@ HOME_BODY = """
             <a href="{{ file.download_url }}">Завантажити</a>
             {% if file.can_rotate %}
               <form class="action-form" method="post" action="{{ file.rotate_url }}">
-                <button type="submit">Повернути 180°</button>
+                <button type="submit">Повернути 90°</button>
               </form>
             {% endif %}
             <form class="action-form print-form" method="post" action="{{ file.print_url }}">
@@ -784,8 +783,8 @@ def run_print_command(file_path: Path) -> str:
 
 
 def print_file_with_lock(file_path: Path) -> tuple[str, str]:
-    if not print_lock.acquire(blocking=False):
-        return "Друк вже відправляється. Спробуйте ще раз за кілька секунд.", "busy"
+    if not command_lock.acquire(blocking=False):
+        return "Сканер або принтер вже виконує іншу команду. Спробуйте ще раз за кілька секунд.", "busy"
 
     try:
         output = run_print_command(file_path)
@@ -798,7 +797,7 @@ def print_file_with_lock(file_path: Path) -> tuple[str, str]:
     except OSError as error:
         return f"Не вдалося запустити команду друку: {error}", "error"
     finally:
-        print_lock.release()
+        command_lock.release()
 
     detail = f" CUPS: {output}" if output else ""
     return f"Файл відправлено на друк.{detail}", "success"
@@ -846,7 +845,7 @@ def save_uploaded_print_file() -> tuple[Path | None, str | None]:
 
 def rotate_image_file(path: Path) -> None:
     with Image.open(path) as image:
-        rotated_image = image.rotate(180, expand=True)
+        rotated_image = image.rotate(-90, expand=True)
         if path.suffix.lower() in {".jpg", ".jpeg"} and rotated_image.mode in {"RGBA", "P"}:
             rotated_image = rotated_image.convert("RGB")
 
@@ -920,7 +919,7 @@ def render_home(
             "output_format": "png",
             "rotation": "none",
         },
-        busy=scan_lock.locked(),
+        busy=command_lock.locked(),
         filename=filename,
         scan_files=list_scan_files(),
         printer_status=get_printer_status(),
@@ -939,8 +938,8 @@ def index() -> str:
     if validation_error:
         return render_home(values, validation_error, "error")
 
-    if not scan_lock.acquire(blocking=False):
-        return render_home(values, "Сканер вже виконує інше сканування.", "busy")
+    if not command_lock.acquire(blocking=False):
+        return render_home(values, "Сканер або принтер вже виконує іншу команду.", "busy")
 
     filename = None
     message = "Сканування завершено."
@@ -960,7 +959,7 @@ def index() -> str:
         message = f"Не вдалося запустити команду: {error}"
         message_type = "error"
     finally:
-        scan_lock.release()
+        command_lock.release()
 
     return render_home(values, message, message_type, filename)
 
@@ -1035,7 +1034,7 @@ def rotate_scan(filename: str) -> str:
     except OSError as error:
         return render_home(message=f"Не вдалося повернути файл: {error}", message_type="error")
 
-    return render_home(message="Файл повернуто на 180°.", message_type="success", filename=requested_path.name)
+    return render_home(message="Файл повернуто на 90°.", message_type="success", filename=requested_path.name)
 
 
 @app.route("/delete/<path:filename>", methods=["POST"])
@@ -1100,8 +1099,8 @@ def health() -> Response:
     return jsonify(
         {
             "status": "ok",
-            "busy": scan_lock.locked(),
-            "print_busy": print_lock.locked(),
+            "busy": command_lock.locked(),
+            "command_busy": command_lock.locked(),
             "scan_dir": str(SCAN_DIR),
             "upload_dir": str(UPLOAD_DIR),
             "printer_name": PRINTER_NAME,
