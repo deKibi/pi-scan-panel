@@ -517,15 +517,6 @@ HOME_BODY = """
   </div>
 {% endif %}
 <p class="hint">A4, область сканування 210 × 297 мм. Файли зберігаються локально на Raspberry Pi.</p>
-<h2 class="section-title">Друк файлу</h2>
-<form class="upload-form print-form" method="post" action="{{ url_for('print_upload') }}" enctype="multipart/form-data">
-  <label>
-    PDF, PNG або JPG
-    <input name="upload" type="file" accept="application/pdf,image/png,image/jpeg" required>
-  </label>
-  <button type="submit">Надрукувати файл</button>
-  <p class="print-status" aria-live="polite"></p>
-</form>
 <div class="printer-status">{{ printer_status }}</div>
 {% if scan_files %}
   <div class="scan-list">
@@ -547,7 +538,7 @@ HOME_BODY = """
             <a href="{{ file.download_url }}">Завантажити</a>
             {% if file.can_rotate %}
               <form class="action-form" method="post" action="{{ file.rotate_url }}">
-                <button type="submit">Повернути 90°</button>
+                <button type="submit">Повернути 180°</button>
               </form>
             {% endif %}
             <form class="action-form print-form" method="post" action="{{ file.print_url }}">
@@ -855,7 +846,7 @@ def save_uploaded_print_file() -> tuple[Path | None, str | None]:
 
 def rotate_image_file(path: Path) -> None:
     with Image.open(path) as image:
-        rotated_image = image.rotate(-90, expand=True)
+        rotated_image = image.rotate(180, expand=True)
         if path.suffix.lower() in {".jpg", ".jpeg"} and rotated_image.mode in {"RGBA", "P"}:
             rotated_image = rotated_image.convert("RGB")
 
@@ -1044,7 +1035,7 @@ def rotate_scan(filename: str) -> str:
     except OSError as error:
         return render_home(message=f"Не вдалося повернути файл: {error}", message_type="error")
 
-    return render_home(message="Файл повернуто на 90°.", message_type="success", filename=requested_path.name)
+    return render_home(message="Файл повернуто на 180°.", message_type="success", filename=requested_path.name)
 
 
 @app.route("/delete/<path:filename>", methods=["POST"])

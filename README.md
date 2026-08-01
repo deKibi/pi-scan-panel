@@ -154,12 +154,12 @@ sudo systemctl status pi-scan-panel
 
 ## Scan File Actions
 
-The web panel can open, download, rotate, print, and delete saved scan files. Rotation is supported for PNG and JPG files. PDF files can be opened, downloaded, printed, and deleted.
+The web panel can open, download, rotate 180 degrees, print, and delete saved scan files. Rotation is supported for PNG and JPG files. PDF files can be opened, downloaded, printed, and deleted.
 
-Uploaded print files are saved only under the configured upload directory and then sent to CUPS with:
+Printing is available from each saved scan row with the `Друк` button. Files are sent to CUPS with:
 
 ```bash
-lp -d Canon_LBP2900 -o media=A4 -n 1 <uploaded-file>
+lp -d Canon_LBP2900 -o media=A4 -n 1 <scan-file>
 ```
 
 ## Health Check
