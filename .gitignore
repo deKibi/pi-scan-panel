@@ -1,0 +1,84 @@
+# =========================
+# 💻 macOS SYSTEM FILES
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# =========================
+# ⚙️ PHP / COMPOSER
+# =========================
+vendor/
+composer.lock
+composer.phar
+.env
+.env.local
+.env.*.local
+
+# =========================
+# 🧰 IDE & PROJECT FILES
+# =========================
+# PhpStorm
+.idea/
+*.iml
+out/
+# JetBrains HTTP Client requests
+.httpclient/
+
+# =========================
+# 🧪 TEST / CACHE / LOGS
+# =========================
+__pycache__/
+*.log
+*.cache
+*.tmp
+*.bak
+*.swp
+*.swo
+*.orig
+*.save
+*.pid
+*.seed
+*.session
+*.sqlite
+
+# =========================
+# 📦 DEPLOYMENT / BUILD
+# =========================
+node_modules/
+dist/
+build/
+coverage/
+public/uploads/tmp/
+tmp/
+temp/
+.cache/
+
+# =========================
+# 🧱 BACKUPS / LOCAL
+# =========================
+*.zip
+*.tar
+*.gz
+*.7z
+*.rar
+*.bak
+*.old
+
+# =========================
+# 🌐 SERVER / LOCALHOST FILES
+# =========================
+# PHP built-in server artifacts
+.phpserver/
+logs/
+sessions/
+
+# Python application data
+/data/rate_limits.sqlite3*
+/data/bot_settings.sqlite3*
