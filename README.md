@@ -7,7 +7,10 @@ Minimal Flask web panel for a USB scanner connected to Raspberry Pi. It lets use
 - Raspberry Pi with Ubuntu Server 24.04 or similar Linux system.
 - Canon CanoScan LiDE 90 or another scanner supported by SANE.
 - `scanimage` installed and working.
+- CUPS installed and the local printer queue working.
+- Printer queue name: `Canon_LBP2900`.
 - One scanner connected to the Raspberry Pi over USB.
+- One printer connected to the Raspberry Pi over USB.
 - Python 3 and pip.
 - The app must run as a regular user, for example `pi`, not as root.
 
@@ -23,13 +26,19 @@ Expected scan command shape:
 scanimage --format=png --mode Color --resolution 300 -x 210 -y 297 > ~/scans/a4-color-300.png
 ```
 
+Check that CUPS can print:
+
+```bash
+lp -d Canon_LBP2900 /usr/share/cups/data/testprint
+```
+
 ## Setup
 
 Install system packages:
 
 ```bash
 sudo apt update
-sudo apt install sane-utils python3 python3-venv python3-pip screen
+sudo apt install sane-utils cups-client python3 python3-venv python3-pip screen
 ```
 
 Create a virtual environment and install Python dependencies:
@@ -139,6 +148,19 @@ sudo systemctl status pi-scan-panel
 - `SCANNER_SCAN_DIR` - directory for generated scan files, defaults to `/home/pi/scans`.
 - `SCANNER_SECRET_KEY` - Flask session secret.
 - `SCANNER_DEVICE` - optional SANE device id. Leave unset when only one scanner is connected.
+- `PI_SCAN_PANEL_PRINTER_NAME` - CUPS printer queue, defaults to `Canon_LBP2900`.
+- `PI_SCAN_PANEL_UPLOAD_DIR` - temporary upload directory for print jobs, defaults to `/home/pi/scans/uploads`.
+- `PI_SCAN_PANEL_MAX_UPLOAD_MB` - maximum upload size in MB, defaults to `25`.
+
+## Scan File Actions
+
+The web panel can open, download, rotate, print, and delete saved scan files. Rotation is supported for PNG and JPG files. PDF files can be opened, downloaded, printed, and deleted.
+
+Uploaded print files are saved only under the configured upload directory and then sent to CUPS with:
+
+```bash
+lp -d Canon_LBP2900 -o media=A4 -n 1 <uploaded-file>
+```
 
 ## Health Check
 

@@ -3,6 +3,7 @@
 # Standard Libraries
 import hmac
 import os
+import re
 import secrets
 import subprocess
 import threading
@@ -25,6 +26,9 @@ from flask import (
     session,
     url_for,
 )
+from PIL import Image
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.utils import secure_filename
 
 
 # Scan settings
@@ -33,11 +37,24 @@ SCAN_RESOLUTIONS: tuple[str, ...] = ("300", "600")
 OUTPUT_FORMATS: tuple[str, ...] = ("png", "pdf")
 ROTATIONS: tuple[str, ...] = ("none", "90", "180", "270")
 DEFAULT_SCAN_DIR = "/home/pi/scans"
+DEFAULT_PRINTER_NAME = "Canon_LBP2900"
+DEFAULT_UPLOAD_DIR = "/home/pi/scans/uploads"
 SCAN_TIMEOUT_SECONDS = 900
+PRINT_TIMEOUT_SECONDS = 60
 KYIV_TIMEZONE = ZoneInfo("Europe/Kyiv")
+SCAN_FILE_EXTENSIONS: frozenset[str] = frozenset({".png", ".pdf", ".jpg", ".jpeg"})
+IMAGE_FILE_EXTENSIONS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg"})
+PRINT_FILE_EXTENSIONS: frozenset[str] = frozenset({".png", ".pdf", ".jpg", ".jpeg"})
+UPLOAD_MIME_TYPES: dict[str, frozenset[str]] = {
+    ".pdf": frozenset({"application/pdf"}),
+    ".png": frozenset({"image/png"}),
+    ".jpg": frozenset({"image/jpeg", "image/pjpeg"}),
+    ".jpeg": frozenset({"image/jpeg", "image/pjpeg"}),
+}
 
 # Runtime state
 scan_lock = threading.Lock()
+print_lock = threading.Lock()
 last_scan: dict[str, str] | None = None
 
 
@@ -47,12 +64,16 @@ APP_USERNAME = os.getenv("SCANNER_USERNAME")
 APP_PASSWORD = os.getenv("SCANNER_PASSWORD")
 SCAN_DIR = Path(os.getenv("SCANNER_SCAN_DIR", DEFAULT_SCAN_DIR)).expanduser()
 SCANNER_DEVICE = os.getenv("SCANNER_DEVICE")
+PRINTER_NAME = os.getenv("PI_SCAN_PANEL_PRINTER_NAME", DEFAULT_PRINTER_NAME)
+UPLOAD_DIR = Path(os.getenv("PI_SCAN_PANEL_UPLOAD_DIR", DEFAULT_UPLOAD_DIR)).expanduser()
+MAX_UPLOAD_MB = int(os.getenv("PI_SCAN_PANEL_MAX_UPLOAD_MB", "25"))
 
 if not APP_USERNAME or not APP_PASSWORD:
     raise RuntimeError("SCANNER_USERNAME and SCANNER_PASSWORD must be set in .env")
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SCANNER_SECRET_KEY") or secrets.token_hex(32)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 
 BASE_TEMPLATE = """
@@ -329,6 +350,53 @@ BASE_TEMPLATE = """
       text-decoration: none;
     }
 
+    .scan-actions form {
+      display: inline;
+    }
+
+    .scan-actions button {
+      background: transparent;
+      color: var(--accent);
+      min-height: auto;
+      padding: 0;
+      text-align: left;
+    }
+
+    .scan-actions .danger {
+      color: var(--danger-text);
+    }
+
+    .section-title {
+      font-size: 1.15rem;
+      letter-spacing: 0;
+      margin: 22px 0 12px;
+    }
+
+    .upload-form {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-top: 16px;
+      padding: 14px;
+    }
+
+    .print-status {
+      color: var(--busy-text);
+      font-weight: 650;
+      margin: -4px 0 0;
+      min-height: 22px;
+    }
+
+    .printer-status {
+      background: #f9fafb;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-top: 14px;
+      padding: 12px;
+      white-space: pre-wrap;
+    }
+
     @media (max-width: 560px) {
       .page {
         padding: 18px 12px 28px;
@@ -394,7 +462,7 @@ LOGIN_BODY = """
 """
 
 HOME_BODY = """
-<form method="post" action="{{ url_for('index') }}">
+<form class="scan-form" method="post" action="{{ url_for('index') }}">
   <div class="grid">
     <label>
       Режим
@@ -449,6 +517,16 @@ HOME_BODY = """
   </div>
 {% endif %}
 <p class="hint">A4, область сканування 210 × 297 мм. Файли зберігаються локально на Raspberry Pi.</p>
+<h2 class="section-title">Друк файлу</h2>
+<form class="upload-form print-form" method="post" action="{{ url_for('print_upload') }}" enctype="multipart/form-data">
+  <label>
+    PDF, PNG або JPG
+    <input name="upload" type="file" accept="application/pdf,image/png,image/jpeg" required>
+  </label>
+  <button type="submit">Надрукувати файл</button>
+  <p class="print-status" aria-live="polite"></p>
+</form>
+<div class="printer-status">{{ printer_status }}</div>
 {% if scan_files %}
   <div class="scan-list">
     <h2>Скани</h2>
@@ -467,6 +545,17 @@ HOME_BODY = """
           <div class="scan-actions">
             <a href="{{ file.open_url }}" target="_blank" rel="noopener">Відкрити</a>
             <a href="{{ file.download_url }}">Завантажити</a>
+            {% if file.can_rotate %}
+              <form class="action-form" method="post" action="{{ file.rotate_url }}">
+                <button type="submit">Повернути 90°</button>
+              </form>
+            {% endif %}
+            <form class="action-form print-form" method="post" action="{{ file.print_url }}">
+              <button type="submit">Друк</button>
+            </form>
+            <form class="action-form delete-form" method="post" action="{{ file.delete_url }}">
+              <button class="danger" type="submit">Видалити</button>
+            </form>
           </div>
         </div>
       </article>
@@ -476,7 +565,7 @@ HOME_BODY = """
   <p class="hint">Поки немає збережених сканів.</p>
 {% endif %}
 <script>
-  const scanForm = document.querySelector("form");
+  const scanForm = document.querySelector(".scan-form");
   const scanButton = scanForm.querySelector("button[type='submit']");
   const scanStatus = document.querySelector("#scan-status");
 
@@ -484,6 +573,43 @@ HOME_BODY = """
     scanButton.disabled = true;
     scanButton.textContent = "Сканування триває...";
     scanStatus.textContent = "Сканер почав роботу. Не закривайте сторінку до завершення.";
+  });
+
+  document.querySelectorAll(".print-form").forEach((form) => {
+    form.addEventListener("submit", () => {
+      const button = form.querySelector("button[type='submit']");
+      const status = form.querySelector(".print-status");
+
+      if (button) {
+        button.disabled = true;
+        button.textContent = "Відправляємо на друк...";
+      }
+      if (status) {
+        status.textContent = "Файл передається у чергу друку.";
+      }
+    });
+  });
+
+  document.querySelectorAll(".delete-form").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      if (!confirm("Видалити цей файл?")) {
+        event.preventDefault();
+      }
+    });
+  });
+
+  document.querySelectorAll(".action-form:not(.print-form)").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      if (event.defaultPrevented) {
+        return;
+      }
+
+      const button = form.querySelector("button[type='submit']");
+
+      if (button) {
+        button.disabled = true;
+      }
+    });
   });
 </script>
 """
@@ -588,7 +714,7 @@ def get_safe_scan_path(filename: str) -> Path | None:
 
     if requested_name != filename:
         return None
-    if requested_path.suffix.lower() not in {".png", ".pdf"}:
+    if requested_path.suffix.lower() not in SCAN_FILE_EXTENSIONS:
         return None
     if not requested_path.is_file():
         return None
@@ -602,7 +728,8 @@ def list_scan_files() -> list[dict[str, Any]]:
 
     files: list[dict[str, Any]] = []
     for path in SCAN_DIR.iterdir():
-        if not path.is_file() or path.suffix.lower() not in {".png", ".pdf"}:
+        suffix = path.suffix.lower()
+        if not path.is_file() or suffix not in SCAN_FILE_EXTENSIONS:
             continue
 
         stat = path.stat()
@@ -613,13 +740,126 @@ def list_scan_files() -> list[dict[str, Any]]:
                 "completed_at": completed_at.strftime("%Y-%m-%d %H:%M:%S"),
                 "mtime": stat.st_mtime,
                 "size": format_file_size(stat.st_size),
-                "is_image": path.suffix.lower() == ".png",
+                "is_image": suffix in IMAGE_FILE_EXTENSIONS,
+                "can_rotate": suffix in IMAGE_FILE_EXTENSIONS,
                 "open_url": url_for("open_scan", filename=path.name),
                 "download_url": url_for("download_scan", filename=path.name),
+                "rotate_url": url_for("rotate_scan", filename=path.name),
+                "print_url": url_for("print_scan", filename=path.name),
+                "delete_url": url_for("delete_scan", filename=path.name),
             }
         )
 
     return sorted(files, key=lambda item: item["mtime"], reverse=True)
+
+
+def get_printer_status() -> str:
+    status_parts: list[str] = []
+    commands = (
+        ["lpstat", "-p", PRINTER_NAME, "-l"],
+        ["lpstat", "-o", PRINTER_NAME],
+    )
+
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return f"Статус принтера недоступний: {error}"
+
+        output = result.stdout.strip() or result.stderr.strip()
+        if output:
+            status_parts.append(output)
+
+    return "\n".join(status_parts) if status_parts else f"Принтер {PRINTER_NAME}: черга порожня."
+
+
+def run_print_command(file_path: Path) -> str:
+    result = subprocess.run(
+        ["lp", "-d", PRINTER_NAME, "-o", "media=A4", "-n", "1", str(file_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+        timeout=PRINT_TIMEOUT_SECONDS,
+    )
+    return result.stdout.strip()
+
+
+def print_file_with_lock(file_path: Path) -> tuple[str, str]:
+    if not print_lock.acquire(blocking=False):
+        return "Друк вже відправляється. Спробуйте ще раз за кілька секунд.", "busy"
+
+    try:
+        output = run_print_command(file_path)
+    except subprocess.TimeoutExpired:
+        return "Передача файлу на друк перевищила ліміт часу.", "error"
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() or error.stdout.strip()
+        suffix = f" Деталі: {detail}" if detail else ""
+        return f"Не вдалося відправити файл на друк.{suffix}", "error"
+    except OSError as error:
+        return f"Не вдалося запустити команду друку: {error}", "error"
+    finally:
+        print_lock.release()
+
+    detail = f" CUPS: {output}" if output else ""
+    return f"Файл відправлено на друк.{detail}", "success"
+
+
+def create_safe_upload_filename(original_filename: str) -> str | None:
+    safe_name = secure_filename(original_filename)
+    if not safe_name:
+        return None
+
+    path = Path(safe_name)
+    suffix = path.suffix.lower()
+    if suffix not in PRINT_FILE_EXTENSIONS:
+        return None
+
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", path.stem).strip("-") or "upload"
+    stem = stem[:80]
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    return f"upload-{timestamp}-{stem}{suffix}"
+
+
+def is_allowed_upload(filename: str, mime_type: str) -> bool:
+    suffix = Path(filename).suffix.lower()
+    allowed_mime_types = UPLOAD_MIME_TYPES.get(suffix)
+
+    return bool(allowed_mime_types and mime_type in allowed_mime_types)
+
+
+def save_uploaded_print_file() -> tuple[Path | None, str | None]:
+    uploaded_file = request.files.get("upload")
+    if uploaded_file is None or not uploaded_file.filename:
+        return None, "Оберіть файл для друку."
+
+    upload_filename = create_safe_upload_filename(uploaded_file.filename)
+    if upload_filename is None:
+        return None, "Підтримуються тільки PDF, PNG, JPG або JPEG."
+    if not is_allowed_upload(upload_filename, uploaded_file.mimetype):
+        return None, "Тип файлу не відповідає дозволеним форматам PDF, PNG або JPG."
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    upload_path = UPLOAD_DIR / upload_filename
+    uploaded_file.save(upload_path)
+    return upload_path, None
+
+
+def rotate_image_file(path: Path) -> None:
+    with Image.open(path) as image:
+        rotated_image = image.rotate(-90, expand=True)
+        if path.suffix.lower() in {".jpg", ".jpeg"} and rotated_image.mode in {"RGBA", "P"}:
+            rotated_image = rotated_image.convert("RGB")
+
+        rotated_image.save(path)
 
 
 def run_scan(values: dict[str, str]) -> str:
@@ -692,6 +932,7 @@ def render_home(
         busy=scan_lock.locked(),
         filename=filename,
         scan_files=list_scan_files(),
+        printer_status=get_printer_status(),
     )
 
 
@@ -788,13 +1029,91 @@ def open_scan(filename: str) -> Response:
     return send_from_directory(SCAN_DIR, requested_path.name, as_attachment=False)
 
 
+@app.route("/rotate/<path:filename>", methods=["POST"])
+@login_required
+def rotate_scan(filename: str) -> str:
+    requested_path = get_safe_scan_path(filename)
+
+    if requested_path is None:
+        return render_home(message="Файл не знайдено або ім'я файлу некоректне.", message_type="error")
+    if requested_path.suffix.lower() not in IMAGE_FILE_EXTENSIONS:
+        return render_home(message="Поворот доступний тільки для PNG або JPG.", message_type="error")
+
+    try:
+        rotate_image_file(requested_path)
+    except OSError as error:
+        return render_home(message=f"Не вдалося повернути файл: {error}", message_type="error")
+
+    return render_home(message="Файл повернуто на 90°.", message_type="success", filename=requested_path.name)
+
+
+@app.route("/delete/<path:filename>", methods=["POST"])
+@login_required
+def delete_scan(filename: str) -> str:
+    global last_scan
+
+    requested_path = get_safe_scan_path(filename)
+
+    if requested_path is None:
+        return render_home(message="Файл не знайдено або ім'я файлу некоректне.", message_type="error")
+
+    try:
+        requested_path.unlink()
+    except OSError as error:
+        return render_home(message=f"Не вдалося видалити файл: {error}", message_type="error")
+
+    if last_scan and last_scan.get("filename") == requested_path.name:
+        last_scan = None
+
+    return render_home(message="Файл видалено.", message_type="success")
+
+
+@app.route("/print/<path:filename>", methods=["POST"])
+@login_required
+def print_scan(filename: str) -> str:
+    requested_path = get_safe_scan_path(filename)
+
+    if requested_path is None:
+        return render_home(message="Файл не знайдено або ім'я файлу некоректне.", message_type="error")
+    if requested_path.suffix.lower() not in PRINT_FILE_EXTENSIONS:
+        return render_home(message="Цей формат не підтримується для друку.", message_type="error")
+
+    message, message_type = print_file_with_lock(requested_path)
+    return render_home(message=message, message_type=message_type, filename=requested_path.name)
+
+
+@app.route("/print-upload", methods=["POST"])
+@login_required
+def print_upload() -> str:
+    upload_path, error = save_uploaded_print_file()
+    if error or upload_path is None:
+        return render_home(message=error or "Не вдалося завантажити файл.", message_type="error")
+
+    message, message_type = print_file_with_lock(upload_path)
+    return render_home(message=message, message_type=message_type)
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_large_upload(error: RequestEntityTooLarge) -> tuple[str, int]:
+    return (
+        render_home(
+            message=f"Файл завеликий. Максимальний розмір: {MAX_UPLOAD_MB} MB.",
+            message_type="error",
+        ),
+        413,
+    )
+
+
 @app.route("/health")
 def health() -> Response:
     return jsonify(
         {
             "status": "ok",
             "busy": scan_lock.locked(),
+            "print_busy": print_lock.locked(),
             "scan_dir": str(SCAN_DIR),
+            "upload_dir": str(UPLOAD_DIR),
+            "printer_name": PRINTER_NAME,
             "auth_configured": bool(APP_USERNAME and APP_PASSWORD),
         }
     )
