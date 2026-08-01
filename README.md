@@ -29,7 +29,7 @@ Install system packages:
 
 ```bash
 sudo apt update
-sudo apt install sane-utils python3 python3-venv python3-pip
+sudo apt install sane-utils python3 python3-venv python3-pip screen
 ```
 
 Create a virtual environment and install Python dependencies:
@@ -71,6 +71,65 @@ From another device on the same LAN, open:
 
 ```text
 http://<raspberry-pi-ip>:8080
+```
+
+## Run in screen
+
+Use `screen` when you want a quick long-running session without keeping the SSH terminal attached:
+
+```bash
+cd /home/pi/pi-scan-panel
+. .venv/bin/activate
+screen -S pi-scan-panel
+python app.py
+```
+
+Detach from the screen session:
+
+```text
+Ctrl+A, then D
+```
+
+Reattach later:
+
+```bash
+screen -r pi-scan-panel
+```
+
+## Run as a systemd service
+
+Create a service file:
+
+```bash
+sudo nano /etc/systemd/system/pi-scan-panel.service
+```
+
+Example service:
+
+```ini
+[Unit]
+Description=Pi Scan Panel
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/pi-scan-panel
+EnvironmentFile=/home/pi/pi-scan-panel/.env
+ExecStart=/home/pi/pi-scan-panel/.venv/bin/python /home/pi/pi-scan-panel/app.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable pi-scan-panel
+sudo systemctl start pi-scan-panel
+sudo systemctl status pi-scan-panel
 ```
 
 ## Configuration

@@ -10,6 +10,7 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # Third-party Libraries
 from dotenv import load_dotenv
@@ -33,6 +34,7 @@ OUTPUT_FORMATS: tuple[str, ...] = ("png", "pdf")
 ROTATIONS: tuple[str, ...] = ("none", "90", "180", "270")
 DEFAULT_SCAN_DIR = "/home/pi/scans"
 SCAN_TIMEOUT_SECONDS = 900
+KYIV_TIMEZONE = ZoneInfo("Europe/Kyiv")
 
 # Runtime state
 scan_lock = threading.Lock()
@@ -227,6 +229,106 @@ BASE_TEMPLATE = """
       margin: 14px 0 0;
     }
 
+    .scan-status {
+      color: var(--busy-text);
+      font-weight: 650;
+      margin: -4px 0 0;
+      min-height: 22px;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .button-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 42px;
+      border-radius: 8px;
+      background: #161a1d;
+      color: #ffffff;
+      font-weight: 750;
+      padding: 9px 13px;
+      text-decoration: none;
+    }
+
+    .scan-list {
+      display: grid;
+      gap: 12px;
+      margin-top: 22px;
+    }
+
+    h2 {
+      font-size: 1.15rem;
+      letter-spacing: 0;
+      margin: 0;
+    }
+
+    .scan-item {
+      display: grid;
+      grid-template-columns: 96px minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+    }
+
+    .scan-preview {
+      align-items: center;
+      aspect-ratio: 1 / 1.25;
+      background: #eef1f5;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--muted);
+      display: flex;
+      font-weight: 800;
+      justify-content: center;
+      overflow: hidden;
+      text-decoration: none;
+      width: 100%;
+    }
+
+    .scan-preview img {
+      display: block;
+      height: 100%;
+      object-fit: cover;
+      width: 100%;
+    }
+
+    .scan-meta {
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+    }
+
+    .scan-meta strong,
+    .scan-meta span {
+      overflow-wrap: anywhere;
+    }
+
+    .scan-meta span {
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .scan-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 4px;
+    }
+
+    .scan-actions a {
+      color: var(--accent);
+      font-weight: 750;
+      text-decoration: none;
+    }
+
     @media (max-width: 560px) {
       .page {
         padding: 18px 12px 28px;
@@ -242,6 +344,15 @@ BASE_TEMPLATE = """
 
       .grid {
         grid-template-columns: 1fr;
+      }
+
+      .actions {
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+
+      .scan-item {
+        grid-template-columns: 74px minmax(0, 1fr);
       }
     }
   </style>
@@ -329,11 +440,52 @@ HOME_BODY = """
   <button type="submit" {% if busy %}disabled{% endif %}>
     {% if busy %}Сканер зайнятий{% else %}Сканувати{% endif %}
   </button>
+  <p class="scan-status" id="scan-status" aria-live="polite"></p>
 </form>
 {% if filename %}
-  <a class="download" href="{{ url_for('download_scan', filename=filename) }}">Завантажити файл</a>
+  <div class="actions">
+    <a class="button-link" href="{{ url_for('open_scan', filename=filename) }}" target="_blank" rel="noopener">Відкрити останній скан</a>
+    <a class="button-link" href="{{ url_for('download_scan', filename=filename) }}">Завантажити останній скан</a>
+  </div>
 {% endif %}
 <p class="hint">A4, область сканування 210 × 297 мм. Файли зберігаються локально на Raspberry Pi.</p>
+{% if scan_files %}
+  <div class="scan-list">
+    <h2>Скани</h2>
+    {% for file in scan_files %}
+      <article class="scan-item">
+        {% if file.is_image %}
+          <a class="scan-preview" href="{{ file.open_url }}" target="_blank" rel="noopener">
+            <img src="{{ file.open_url }}" alt="{{ file.name }}">
+          </a>
+        {% else %}
+          <a class="scan-preview pdf-preview" href="{{ file.open_url }}" target="_blank" rel="noopener">PDF</a>
+        {% endif %}
+        <div class="scan-meta">
+          <strong>{{ file.name }}</strong>
+          <span>{{ file.completed_at }} · {{ file.size }}</span>
+          <div class="scan-actions">
+            <a href="{{ file.open_url }}" target="_blank" rel="noopener">Відкрити</a>
+            <a href="{{ file.download_url }}">Завантажити</a>
+          </div>
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="hint">Поки немає збережених сканів.</p>
+{% endif %}
+<script>
+  const scanForm = document.querySelector("form");
+  const scanButton = scanForm.querySelector("button[type='submit']");
+  const scanStatus = document.querySelector("#scan-status");
+
+  scanForm.addEventListener("submit", () => {
+    scanButton.disabled = true;
+    scanButton.textContent = "Сканування триває...";
+    scanStatus.textContent = "Сканер почав роботу. Не закривайте сторінку до завершення.";
+  });
+</script>
 """
 
 
@@ -421,6 +573,55 @@ def create_timestamped_filename(extension: str) -> str:
     return f"scan-{timestamp}.{extension}"
 
 
+def format_file_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+
+    return f"{size_bytes / 1024 / 1024:.1f} MB"
+
+
+def get_safe_scan_path(filename: str) -> Path | None:
+    requested_name = Path(filename).name
+    requested_path = SCAN_DIR / requested_name
+
+    if requested_name != filename:
+        return None
+    if requested_path.suffix.lower() not in {".png", ".pdf"}:
+        return None
+    if not requested_path.is_file():
+        return None
+
+    return requested_path
+
+
+def list_scan_files() -> list[dict[str, Any]]:
+    if not SCAN_DIR.is_dir():
+        return []
+
+    files: list[dict[str, Any]] = []
+    for path in SCAN_DIR.iterdir():
+        if not path.is_file() or path.suffix.lower() not in {".png", ".pdf"}:
+            continue
+
+        stat = path.stat()
+        completed_at = datetime.fromtimestamp(stat.st_mtime, tz=KYIV_TIMEZONE)
+        files.append(
+            {
+                "name": path.name,
+                "completed_at": completed_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "mtime": stat.st_mtime,
+                "size": format_file_size(stat.st_size),
+                "is_image": path.suffix.lower() == ".png",
+                "open_url": url_for("open_scan", filename=path.name),
+                "download_url": url_for("download_scan", filename=path.name),
+            }
+        )
+
+    return sorted(files, key=lambda item: item["mtime"], reverse=True)
+
+
 def run_scan(values: dict[str, str]) -> str:
     global last_scan
 
@@ -459,6 +660,7 @@ def run_scan(values: dict[str, str]) -> str:
         pdf_path.unlink(missing_ok=True)
         raise
 
+    png_path.unlink(missing_ok=True)
     last_scan = {"filename": pdf_filename, "format": "pdf"}
     return pdf_filename
 
@@ -489,6 +691,7 @@ def render_home(
         },
         busy=scan_lock.locked(),
         filename=filename,
+        scan_files=list_scan_files(),
     )
 
 
@@ -507,20 +710,27 @@ def index() -> str:
     if not scan_lock.acquire(blocking=False):
         return render_home(values, "Сканер вже виконує інше сканування.", "busy")
 
+    filename = None
+    message = "Сканування завершено."
+    message_type = "success"
+
     try:
         filename = run_scan(values)
     except subprocess.TimeoutExpired:
-        return render_home(values, "Сканування перевищило ліміт часу.", "error")
+        message = "Сканування перевищило ліміт часу."
+        message_type = "error"
     except subprocess.CalledProcessError as error:
         stderr = error.stderr.decode("utf-8", errors="replace").strip()
         detail = f" Деталі: {stderr}" if stderr else ""
-        return render_home(values, f"Команда сканування завершилась з помилкою.{detail}", "error")
+        message = f"Команда сканування завершилась з помилкою.{detail}"
+        message_type = "error"
     except OSError as error:
-        return render_home(values, f"Не вдалося запустити команду: {error}", "error")
+        message = f"Не вдалося запустити команду: {error}"
+        message_type = "error"
     finally:
         scan_lock.release()
 
-    return render_home(values, "Сканування завершено.", "success", filename)
+    return render_home(values, message, message_type, filename)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -559,15 +769,23 @@ def logout() -> Response:
 @app.route("/download/<path:filename>")
 @login_required
 def download_scan(filename: str) -> Response:
-    requested_name = Path(filename).name
-    requested_path = SCAN_DIR / requested_name
+    requested_path = get_safe_scan_path(filename)
 
-    if requested_name != filename or requested_path.suffix.lower() not in {".png", ".pdf"}:
+    if requested_path is None:
         return Response("Invalid filename", status=400)
-    if not requested_path.is_file():
-        return Response("File not found", status=404)
 
-    return send_from_directory(SCAN_DIR, requested_name, as_attachment=True)
+    return send_from_directory(SCAN_DIR, requested_path.name, as_attachment=True)
+
+
+@app.route("/files/<path:filename>")
+@login_required
+def open_scan(filename: str) -> Response:
+    requested_path = get_safe_scan_path(filename)
+
+    if requested_path is None:
+        return Response("Invalid filename", status=400)
+
+    return send_from_directory(SCAN_DIR, requested_path.name, as_attachment=False)
 
 
 @app.route("/health")
