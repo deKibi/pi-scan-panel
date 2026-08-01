@@ -656,8 +656,6 @@ def validate_form(values: dict[str, str]) -> str | None:
         return "Невідомий формат файлу."
     if values["rotation"] not in ROTATIONS:
         return "Невідоме значення повороту."
-    if values["rotation"] != "none":
-        return "Поворот ще не реалізований у MVP. Запустіть скан без повороту."
 
     return None
 
@@ -843,13 +841,20 @@ def save_uploaded_print_file() -> tuple[Path | None, str | None]:
     return upload_path, None
 
 
-def rotate_image_file(path: Path) -> None:
+def rotate_image_file(path: Path, degrees: int = 90) -> None:
     with Image.open(path) as image:
-        rotated_image = image.rotate(-90, expand=True)
+        rotated_image = image.rotate(-degrees, expand=True)
         if path.suffix.lower() in {".jpg", ".jpeg"} and rotated_image.mode in {"RGBA", "P"}:
             rotated_image = rotated_image.convert("RGB")
 
         rotated_image.save(path)
+
+
+def apply_scan_rotation(path: Path, rotation: str) -> None:
+    if rotation == "none":
+        return
+
+    rotate_image_file(path, int(rotation))
 
 
 def run_scan(values: dict[str, str]) -> str:
@@ -868,6 +873,7 @@ def run_scan(values: dict[str, str]) -> str:
                 check=True,
                 timeout=SCAN_TIMEOUT_SECONDS,
             )
+        apply_scan_rotation(png_path, values["rotation"])
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         png_path.unlink(missing_ok=True)
         raise

@@ -154,6 +154,8 @@ sudo systemctl status pi-scan-panel
 
 ## Scan File Actions
 
+The scan form supports rotation during scanning: no rotation, 90, 180, or 270 degrees. PDF scans are rotated before PDF conversion.
+
 The web panel can open, download, rotate 90 degrees, print, and delete saved scan files. Press rotate twice for 180 degrees. Rotation is supported for PNG and JPG files. PDF files can be opened, downloaded, printed, and deleted.
 
 Printing is available from each saved scan row with the `Друк` button. Files are sent to CUPS with:
