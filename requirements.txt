@@ -1,0 +1,3 @@
+Flask
+python-dotenv
+img2pdf

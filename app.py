@@ -1,12 +1,586 @@
-from flask import Flask
+# app.py
+
+# Standard Libraries
+import hmac
+import os
+import secrets
+import subprocess
+import threading
+from datetime import datetime
+from functools import wraps
+from pathlib import Path
+from typing import Any
+
+# Third-party Libraries
+from dotenv import load_dotenv
+from flask import (
+    Flask,
+    Response,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    send_from_directory,
+    session,
+    url_for,
+)
+
+
+# Scan settings
+SCAN_MODES: tuple[str, ...] = ("Color", "Gray", "Lineart")
+SCAN_RESOLUTIONS: tuple[str, ...] = ("300", "600")
+OUTPUT_FORMATS: tuple[str, ...] = ("png", "pdf")
+ROTATIONS: tuple[str, ...] = ("none", "90", "180", "270")
+DEFAULT_SCAN_DIR = "/home/pi/scans"
+SCAN_TIMEOUT_SECONDS = 900
+
+# Runtime state
+scan_lock = threading.Lock()
+last_scan: dict[str, str] | None = None
+
+
+load_dotenv()
+
+APP_USERNAME = os.getenv("SCANNER_USERNAME")
+APP_PASSWORD = os.getenv("SCANNER_PASSWORD")
+SCAN_DIR = Path(os.getenv("SCANNER_SCAN_DIR", DEFAULT_SCAN_DIR)).expanduser()
+SCANNER_DEVICE = os.getenv("SCANNER_DEVICE")
+
+if not APP_USERNAME or not APP_PASSWORD:
+    raise RuntimeError("SCANNER_USERNAME and SCANNER_PASSWORD must be set in .env")
 
 app = Flask(__name__)
+app.secret_key = os.getenv("SCANNER_SECRET_KEY") or secrets.token_hex(32)
 
 
-@app.route('/')
-def hello_world():  # put application's code here
-    return 'Hello World!'
+BASE_TEMPLATE = """
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #161a1d;
+      --muted: #63707c;
+      --border: #d9dee5;
+      --accent: #1f6feb;
+      --accent-strong: #1458c8;
+      --danger-bg: #fff0f0;
+      --danger-text: #9f1d1d;
+      --success-bg: #edf9f1;
+      --success-text: #1b6b35;
+      --busy-bg: #fff7e6;
+      --busy-text: #795100;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.45;
+    }
+
+    .page {
+      width: min(100%, 720px);
+      margin: 0 auto;
+      padding: 24px 16px 36px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.55rem, 4vw, 2.2rem);
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 0.98rem;
+    }
+
+    .logout {
+      color: var(--accent);
+      font-weight: 650;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+    }
+
+    form {
+      display: grid;
+      gap: 16px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    label {
+      display: grid;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-weight: 650;
+    }
+
+    select,
+    input {
+      width: 100%;
+      min-height: 46px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #ffffff;
+      color: var(--text);
+      font: inherit;
+      padding: 10px 12px;
+    }
+
+    button {
+      min-height: 50px;
+      border: 0;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #ffffff;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 750;
+      padding: 12px 16px;
+    }
+
+    button:active {
+      background: var(--accent-strong);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.65;
+    }
+
+    .message {
+      border-radius: 8px;
+      margin: 0 0 16px;
+      padding: 12px 14px;
+      font-weight: 650;
+    }
+
+    .message.error {
+      background: var(--danger-bg);
+      color: var(--danger-text);
+    }
+
+    .message.success {
+      background: var(--success-bg);
+      color: var(--success-text);
+    }
+
+    .message.busy {
+      background: var(--busy-bg);
+      color: var(--busy-text);
+    }
+
+    .download {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 46px;
+      border-radius: 8px;
+      background: #161a1d;
+      color: #ffffff;
+      font-weight: 750;
+      margin-top: 12px;
+      padding: 10px 14px;
+      text-decoration: none;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin: 14px 0 0;
+    }
+
+    @media (max-width: 560px) {
+      .page {
+        padding: 18px 12px 28px;
+      }
+
+      .topbar {
+        align-items: flex-start;
+      }
+
+      .panel {
+        padding: 16px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="topbar">
+      <div>
+        <h1>{{ heading }}</h1>
+        {% if subtitle %}<p class="subtitle">{{ subtitle }}</p>{% endif %}
+      </div>
+      {% if logged_in %}
+        <a class="logout" href="{{ url_for('logout') }}">Вийти</a>
+      {% endif %}
+    </div>
+    <section class="panel">
+      {% if message %}
+        <p class="message {{ message_type }}">{{ message }}</p>
+      {% endif %}
+      {{ body|safe }}
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+LOGIN_BODY = """
+<form method="post" action="{{ url_for('login') }}">
+  <label>
+    Логін
+    <input name="username" autocomplete="username" required autofocus>
+  </label>
+  <label>
+    Пароль
+    <input name="password" type="password" autocomplete="current-password" required>
+  </label>
+  <button type="submit">Увійти</button>
+</form>
+"""
+
+HOME_BODY = """
+<form method="post" action="{{ url_for('index') }}">
+  <div class="grid">
+    <label>
+      Режим
+      <select name="mode">
+        {% for item in modes %}
+          <option value="{{ item }}" {% if values.mode == item %}selected{% endif %}>
+            {{ item }}
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      Роздільність
+      <select name="resolution">
+        {% for item in resolutions %}
+          <option value="{{ item }}" {% if values.resolution == item %}selected{% endif %}>
+            {{ item }} dpi
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      Формат
+      <select name="output_format">
+        {% for item in formats %}
+          <option value="{{ item }}" {% if values.output_format == item %}selected{% endif %}>
+            {{ item|upper }}
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      Поворот
+      <select name="rotation">
+        {% for item in rotations %}
+          <option value="{{ item }}" {% if values.rotation == item %}selected{% endif %}>
+            {% if item == "none" %}Без повороту{% else %}{{ item }}°{% endif %}
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+  <button type="submit" {% if busy %}disabled{% endif %}>
+    {% if busy %}Сканер зайнятий{% else %}Сканувати{% endif %}
+  </button>
+</form>
+{% if filename %}
+  <a class="download" href="{{ url_for('download_scan', filename=filename) }}">Завантажити файл</a>
+{% endif %}
+<p class="hint">A4, область сканування 210 × 297 мм. Файли зберігаються локально на Raspberry Pi.</p>
+"""
 
 
-if __name__ == '__main__':
-    app.run()
+def render_page(
+    title: str,
+    heading: str,
+    body_template: str,
+    message: str | None = None,
+    message_type: str = "success",
+    subtitle: str | None = None,
+    **context: Any,
+) -> str:
+    body = render_template_string(body_template, **context)
+    return render_template_string(
+        BASE_TEMPLATE,
+        title=title,
+        heading=heading,
+        subtitle=subtitle,
+        logged_in=session.get("logged_in"),
+        message=message,
+        message_type=message_type,
+        body=body,
+    )
+
+
+def login_required(view: Any) -> Any:
+    @wraps(view)
+    def wrapped_view(*args: Any, **kwargs: Any) -> Any:
+        if not session.get("logged_in"):
+            return redirect(url_for("login"))
+
+        return view(*args, **kwargs)
+
+    return wrapped_view
+
+
+def get_form_values() -> dict[str, str]:
+    return {
+        "mode": request.form.get("mode", "Color"),
+        "resolution": request.form.get("resolution", "300"),
+        "output_format": request.form.get("output_format", "png"),
+        "rotation": request.form.get("rotation", "none"),
+    }
+
+
+def validate_form(values: dict[str, str]) -> str | None:
+    if values["mode"] not in SCAN_MODES:
+        return "Невідомий режим сканування."
+    if values["resolution"] not in SCAN_RESOLUTIONS:
+        return "Невідома роздільність."
+    if values["output_format"] not in OUTPUT_FORMATS:
+        return "Невідомий формат файлу."
+    if values["rotation"] not in ROTATIONS:
+        return "Невідоме значення повороту."
+    if values["rotation"] != "none":
+        return "Поворот ще не реалізований у MVP. Запустіть скан без повороту."
+
+    return None
+
+
+def build_scan_command(values: dict[str, str]) -> list[str]:
+    command = ["scanimage"]
+
+    if SCANNER_DEVICE:
+        command.extend(["-d", SCANNER_DEVICE])
+
+    command.extend(
+        [
+            "--format=png",
+            "--mode",
+            values["mode"],
+            "--resolution",
+            values["resolution"],
+            "-x",
+            "210",
+            "-y",
+            "297",
+        ]
+    )
+    return command
+
+
+def create_timestamped_filename(extension: str) -> str:
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    return f"scan-{timestamp}.{extension}"
+
+
+def run_scan(values: dict[str, str]) -> str:
+    global last_scan
+
+    SCAN_DIR.mkdir(parents=True, exist_ok=True)
+    png_filename = create_timestamped_filename("png")
+    png_path = SCAN_DIR / png_filename
+
+    try:
+        with png_path.open("wb") as png_file:
+            subprocess.run(
+                build_scan_command(values),
+                stdout=png_file,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=SCAN_TIMEOUT_SECONDS,
+            )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        png_path.unlink(missing_ok=True)
+        raise
+
+    if values["output_format"] == "png":
+        last_scan = {"filename": png_filename, "format": "png"}
+        return png_filename
+
+    pdf_filename = png_path.with_suffix(".pdf").name
+    pdf_path = SCAN_DIR / pdf_filename
+    try:
+        subprocess.run(
+            ["img2pdf", str(png_path), "-o", str(pdf_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=SCAN_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pdf_path.unlink(missing_ok=True)
+        raise
+
+    last_scan = {"filename": pdf_filename, "format": "pdf"}
+    return pdf_filename
+
+
+def render_home(
+    values: dict[str, str] | None = None,
+    message: str | None = None,
+    message_type: str = "success",
+    filename: str | None = None,
+) -> str:
+    return render_page(
+        title="Pi Scan Panel",
+        heading="Pi Scan Panel",
+        subtitle="Локальна веб-панель для USB-сканера",
+        body_template=HOME_BODY,
+        message=message,
+        message_type=message_type,
+        modes=SCAN_MODES,
+        resolutions=SCAN_RESOLUTIONS,
+        formats=OUTPUT_FORMATS,
+        rotations=ROTATIONS,
+        values=values
+        or {
+            "mode": "Color",
+            "resolution": "300",
+            "output_format": "png",
+            "rotation": "none",
+        },
+        busy=scan_lock.locked(),
+        filename=filename,
+    )
+
+
+@app.route("/", methods=["GET", "POST"])
+@login_required
+def index() -> str:
+    if request.method == "GET":
+        filename = last_scan["filename"] if last_scan else None
+        return render_home(filename=filename)
+
+    values = get_form_values()
+    validation_error = validate_form(values)
+    if validation_error:
+        return render_home(values, validation_error, "error")
+
+    if not scan_lock.acquire(blocking=False):
+        return render_home(values, "Сканер вже виконує інше сканування.", "busy")
+
+    try:
+        filename = run_scan(values)
+    except subprocess.TimeoutExpired:
+        return render_home(values, "Сканування перевищило ліміт часу.", "error")
+    except subprocess.CalledProcessError as error:
+        stderr = error.stderr.decode("utf-8", errors="replace").strip()
+        detail = f" Деталі: {stderr}" if stderr else ""
+        return render_home(values, f"Команда сканування завершилась з помилкою.{detail}", "error")
+    except OSError as error:
+        return render_home(values, f"Не вдалося запустити команду: {error}", "error")
+    finally:
+        scan_lock.release()
+
+    return render_home(values, "Сканування завершено.", "success", filename)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login() -> str | Response:
+    if request.method == "GET":
+        return render_page(
+            title="Вхід",
+            heading="Вхід",
+            subtitle="Доступ тільки для локальних користувачів",
+            body_template=LOGIN_BODY,
+        )
+
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    if hmac.compare_digest(username, APP_USERNAME) and hmac.compare_digest(password, APP_PASSWORD):
+        session.clear()
+        session["logged_in"] = True
+        return redirect(url_for("index"))
+
+    return render_page(
+        title="Вхід",
+        heading="Вхід",
+        subtitle="Доступ тільки для локальних користувачів",
+        body_template=LOGIN_BODY,
+        message="Невірний логін або пароль.",
+        message_type="error",
+    )
+
+
+@app.route("/logout")
+def logout() -> Response:
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/download/<path:filename>")
+@login_required
+def download_scan(filename: str) -> Response:
+    requested_name = Path(filename).name
+    requested_path = SCAN_DIR / requested_name
+
+    if requested_name != filename or requested_path.suffix.lower() not in {".png", ".pdf"}:
+        return Response("Invalid filename", status=400)
+    if not requested_path.is_file():
+        return Response("File not found", status=404)
+
+    return send_from_directory(SCAN_DIR, requested_name, as_attachment=True)
+
+
+@app.route("/health")
+def health() -> Response:
+    return jsonify(
+        {
+            "status": "ok",
+            "busy": scan_lock.locked(),
+            "scan_dir": str(SCAN_DIR),
+            "auth_configured": bool(APP_USERNAME and APP_PASSWORD),
+        }
+    )
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
