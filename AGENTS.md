@@ -328,6 +328,21 @@ Examples:
 - `docs: document local project setup`
 - `chore: update Codex project guidelines`
 
+### Pull Request Description Suggestions
+
+- When the developer explicitly asks for a pull request description, inspect the actual current changes using relevant read-only Git context before drafting it.
+- Provide the description using these sections in this order:
+  - `## Summary`
+  - `## Testing`
+  - `## Notes`
+- Always include the `Notes` section.
+- Use `Notes` to describe production steps, configuration changes, migrations, service restarts, compatibility concerns, known limitations, and required follow-up work.
+- When no additional action is required, use a meaningful statement based on the actual changes, such as `No database migrations or production configuration changes are required.`
+- Do not use empty placeholders such as `None` or `N/A` in `Notes`.
+- Report only tests that were actually run and only manual or production steps supported by the current changes.
+- Do not invent deployment requirements, migrations, configuration changes, limitations, or follow-up work.
+- A request for a pull request description does not grant permission to create or edit the pull request.
+
 Never discard or overwrite developer changes.
 
 ## Commands and External Systems
@@ -355,10 +370,24 @@ Do not run the application entry point merely to test it when it may connect to 
 
 - Verify only the behavior affected by the requested change.
 - Prefer existing tests and existing project commands.
+- By default, run the smallest focused set of tests that directly covers the
+  changed behavior, plus adjacent tests only when they are needed to detect
+  likely regressions.
+- Do not run the full test suite for small or localized changes.
+- Run the full test suite only for large or cross-cutting changes that affect
+  shared infrastructure, configuration, models or migrations, authentication or
+  security, dependencies, or multiple subsystems.
+- Before starting the full test suite, briefly state why it is warranted and
+  what will be run. Separate approval is not required when the change clearly
+  meets the large or cross-cutting criteria above.
+- When the necessary test scope is uncertain, expand focused coverage
+  incrementally instead of immediately running the full suite.
 - Do not rewrite unrelated tests to make a change pass.
 - Do not weaken assertions, disable checks, or suppress failures without approval.
 - If tests cannot be run safely, explain what was not verified.
 - Never claim that a test passed unless it was actually executed successfully.
+- In the final response, explicitly state when only focused tests were run and
+  the full test suite was not run.
 
 ## Final Response After Changes
 

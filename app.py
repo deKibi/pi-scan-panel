@@ -7,7 +7,7 @@ import re
 import secrets
 import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from flask import (
     Flask,
     Response,
+    flash,
     jsonify,
     redirect,
     render_template_string,
@@ -90,6 +91,7 @@ BASE_TEMPLATE = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }}</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
   <style>
     :root {
       color-scheme: light;
@@ -155,12 +157,79 @@ BASE_TEMPLATE = """
       white-space: nowrap;
     }
 
+    .secondary-link {
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-weight: 400;
+      padding: 4px 0;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
+    .logout:hover,
+    .secondary-link:hover {
+      text-decoration: underline;
+    }
+
+    .secondary-link:hover {
+      color: var(--text);
+    }
+
+    .back-link,
+    .back-link:hover {
+      color: var(--accent);
+    }
+
+    .trash-link,
+    .trash-link:hover {
+      color: var(--danger-text);
+    }
+
+    .logout:focus-visible,
+    .secondary-link:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
     .panel {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 20px;
       box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+    }
+
+    .confirm-dialog {
+      width: min(420px, calc(100% - 32px));
+      max-height: calc(100dvh - 32px);
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 24px;
+    }
+
+    .confirm-dialog::backdrop {
+      background: rgba(15, 23, 42, 0.45);
+    }
+
+    .confirm-dialog p {
+      overflow-wrap: anywhere;
+    }
+
+    .confirm-dialog .actions {
+      justify-content: flex-end;
+    }
+
+    .confirm-dialog .cancel-button {
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .confirm-dialog button:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
     }
 
     form {
@@ -257,6 +326,10 @@ BASE_TEMPLATE = """
       margin: 14px 0 0;
     }
 
+    .trash-empty-form {
+      margin-top: 16px;
+    }
+
     .scan-status {
       color: var(--busy-text);
       font-weight: 650;
@@ -288,6 +361,18 @@ BASE_TEMPLATE = """
       display: grid;
       gap: 12px;
       margin-top: 22px;
+    }
+
+    .scan-list-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 22px;
+    }
+
+    .scan-list-heading + .scan-list {
+      margin-top: 12px;
     }
 
     h2 {
@@ -482,6 +567,12 @@ BASE_TEMPLATE = """
       color: var(--danger-text);
     }
 
+    .danger-button,
+    .danger-button:active {
+      background: var(--danger-bg);
+      color: var(--danger-text);
+    }
+
     .section-title {
       font-size: 1.15rem;
       letter-spacing: 0;
@@ -565,12 +656,110 @@ BASE_TEMPLATE = """
       {% endif %}
     </div>
     <section class="panel">
+      {% for category, text in get_flashed_messages(with_categories=true) %}
+        <p class="message {{ category }}" role="status">{{ text }}</p>
+      {% endfor %}
       {% if message %}
         <p class="message {{ message_type }}">{{ message }}</p>
       {% endif %}
       {{ body|safe }}
     </section>
   </main>
+  {% if logged_in %}
+    <script src="{{ url_for('static', filename='scan-previews.js') }}" defer></script>
+    <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-message"></p>
+      <div class="actions">
+        <button class="cancel-button" id="confirm-cancel" type="button" autofocus>Скасувати</button>
+        <button class="danger-button" id="confirm-accept" type="button"></button>
+      </div>
+    </dialog>
+    <script type="module">
+      import { lockScroll } from "{{ url_for('static', filename='scroll-lock.js') }}";
+
+      const dialog = document.querySelector("#confirm-dialog");
+      const cancelButton = document.querySelector("#confirm-cancel");
+      const acceptButton = document.querySelector("#confirm-accept");
+      const approved = new WeakSet();
+      let pending = null;
+      let unlockScroll = null;
+      let backdropPointer = false;
+
+      function finish(confirmed) {
+        if (!pending) return;
+        const { form, submitter, opener } = pending;
+        pending = null;
+        if (dialog.open) dialog.close();
+        if (unlockScroll) unlockScroll();
+        unlockScroll = null;
+        if (opener && opener.isConnected) opener.focus({ preventScroll: true });
+        if (confirmed) {
+          approved.add(form);
+          form.requestSubmit(submitter || undefined);
+        }
+      }
+
+      document.addEventListener("submit", (event) => {
+        const form = event.target;
+        if (!form.matches("form[data-confirm]")) return;
+        if (approved.has(form)) {
+          approved.delete(form);
+          return;
+        }
+        event.preventDefault();
+        if (pending) return;
+        pending = {
+          form,
+          submitter: event.submitter,
+          opener: event.submitter || document.activeElement,
+        };
+        document.querySelector("#confirm-title").textContent = form.dataset.confirmTitle;
+        document.querySelector("#confirm-message").textContent = form.dataset.confirm;
+        acceptButton.textContent = form.dataset.confirmAction;
+        try {
+          if (typeof dialog.showModal !== "function") {
+            throw new Error("Modal dialogs are unavailable");
+          }
+          unlockScroll = lockScroll();
+          dialog.showModal();
+          cancelButton.focus({ preventScroll: true });
+        } catch (error) {
+          if (dialog.open) dialog.close();
+          if (unlockScroll) unlockScroll();
+          unlockScroll = null;
+          // Only opening failures use the system confirmation.
+          const confirmed = window.confirm(form.dataset.confirm);
+          // The browser ignores reentrant submission during the original event.
+          setTimeout(() => finish(confirmed), 0);
+        }
+      }, true);
+
+      cancelButton.addEventListener("click", () => finish(false));
+      acceptButton.addEventListener("click", () => finish(true));
+      dialog.addEventListener("cancel", (event) => {
+        event.preventDefault();
+        finish(false);
+      });
+      dialog.addEventListener("close", () => {
+        if (!dialog.open && unlockScroll) finish(false);
+      });
+      function outsideDialog(event) {
+        const bounds = dialog.getBoundingClientRect();
+        return event.clientX < bounds.left || event.clientX > bounds.right
+          || event.clientY < bounds.top || event.clientY > bounds.bottom;
+      }
+      dialog.addEventListener("pointerdown", (event) => {
+        backdropPointer = event.target === dialog && outsideDialog(event);
+      });
+      dialog.addEventListener("click", (event) => {
+        if (backdropPointer && event.target === dialog && outsideDialog(event)) {
+          finish(false);
+        }
+        backdropPointer = false;
+      });
+    </script>
+  {% endif %}
 </body>
 </html>
 """
@@ -646,9 +835,12 @@ HOME_BODY = """
 {% endif %}
 <p class="hint">A4, область сканування 210 × 297 мм. Файли зберігаються локально на Raspberry Pi.</p>
 <div class="printer-status" id="printer-status" data-status-url="{{ url_for('printer_status') }}" aria-live="polite">Завантажуємо статус принтера...</div>
+<div class="scan-list-heading">
+  <h2>Скани</h2>
+  <a class="secondary-link trash-link" href="{{ url_for('trash') }}">Кошик</a>
+</div>
 {% if scan_files %}
   <div class="scan-list">
-    <h2>Скани</h2>
     {% for file in scan_files %}
       <article class="scan-item">
         {% if file.is_image %}
@@ -677,7 +869,9 @@ HOME_BODY = """
             <form class="action-form print-form" method="post" action="{{ file.print_url }}">
               <button type="submit">Друк</button>
             </form>
-            <form class="action-form delete-form" method="post" action="{{ file.delete_url }}">
+            <form class="action-form delete-form" method="post" action="{{ file.delete_url }}"
+                  data-confirm-title="Видалити файл?" data-confirm-action="Видалити"
+                  data-confirm="«{{ file.name }}» буде переміщено в кошик. Файл можна буде відновити.">
               <button class="danger" type="submit">Видалити</button>
             </form>
           </div>
@@ -724,72 +918,7 @@ HOME_BODY = """
     });
   }
 
-  // Start image requests after the document loads so previews do not hold up the page.
   window.addEventListener("load", () => {
-    const previewQueue = new Set();
-    const previewMargin = 200;
-    const maxActivePreviews = 2;
-    let activePreviews = 0;
-
-    function loadNextPreviews() {
-      const candidates = [...previewQueue].map((image) => {
-        const bounds = image.getBoundingClientRect();
-        return {
-          image,
-          top: bounds.top,
-          bottom: bounds.bottom,
-          visible: bounds.bottom > 0 && bounds.top < window.innerHeight,
-        };
-      }).filter((item) => (
-        item.bottom >= -previewMargin && item.top <= window.innerHeight + previewMargin
-      )).sort((first, second) => (
-        Number(second.visible) - Number(first.visible) || first.top - second.top
-      ));
-
-      for (const { image, visible } of candidates) {
-        if (activePreviews >= maxActivePreviews) {
-          break;
-        }
-
-        previewQueue.delete(image);
-        previewObserver.unobserve(image);
-        activePreviews += 1;
-        image.fetchPriority = visible ? "high" : "low";
-
-        function finishPreview(loaded) {
-          const preview = image.closest(".scan-preview");
-          if (loaded) {
-            preview.classList.add("is-loaded");
-          } else {
-            preview.classList.add("is-error");
-            preview.title = "Прев’ю недоступне. Відкрити оригінал.";
-            preview.setAttribute("aria-label", `${image.alt}: ${preview.title}`);
-          }
-          activePreviews -= 1;
-          loadNextPreviews();
-        }
-
-        image.addEventListener("load", () => finishPreview(true), { once: true });
-        image.addEventListener("error", () => finishPreview(false), { once: true });
-        image.src = image.dataset.previewSrc;
-      }
-    }
-
-    const previewObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (entry.isIntersecting) {
-          previewQueue.add(entry.target);
-        } else {
-          previewQueue.delete(entry.target);
-        }
-      }
-      loadNextPreviews();
-    }, { rootMargin: `${previewMargin}px 0px` });
-
-    document.querySelectorAll("img[data-preview-src]").forEach((image) => {
-      previewObserver.observe(image);
-    });
-
     const printerStatus = document.querySelector("#printer-status");
     fetch(printerStatus.dataset.statusUrl, { cache: "no-store" })
       .then((response) => {
@@ -831,14 +960,6 @@ HOME_BODY = """
     });
   });
 
-  document.querySelectorAll(".delete-form").forEach((form) => {
-    form.addEventListener("submit", (event) => {
-      if (!confirm("Видалити цей файл?")) {
-        event.preventDefault();
-      }
-    });
-  });
-
   document.querySelectorAll(".action-form:not(.print-form)").forEach((form) => {
     form.addEventListener("submit", (event) => {
       if (event.defaultPrevented) {
@@ -850,6 +971,93 @@ HOME_BODY = """
       if (button) {
         button.disabled = true;
       }
+    });
+  });
+</script>
+"""
+
+
+TRASH_BODY = """
+<a class="secondary-link back-link" href="{{ url_for('index') }}">← До сканів</a>
+<p class="hint">Файли в кошику можна відновити. Автоматичне очищення вимкнене.</p>
+{% if files %}
+  <form class="trash-action trash-empty-form" method="post" action="{{ url_for('empty_trash') }}"
+        data-confirm-title="Очистити кошик?" data-confirm-action="Очистити кошик"
+        data-confirm="Остаточно видалити всі файли кошика ({{ total }})? Відновити їх буде неможливо.">
+    {% for entry_id in entry_ids %}
+      <input type="hidden" name="entry_id" value="{{ entry_id }}">
+    {% endfor %}
+    <button class="danger-button" type="submit">Очистити кошик ({{ total }})</button>
+  </form>
+  <div class="scan-list">
+    {% for file in files %}
+      <article class="scan-item">
+        {% if file.is_image %}
+          <div class="scan-preview">
+            <svg class="preview-error" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+              <circle cx="8" cy="8" r="1.5"></circle>
+              <path d="m21 15-5-5L5 21M3 3l18 18"></path>
+            </svg>
+            <img data-preview-src="{{ file.preview_url }}" alt="{{ file.name }}" width="96" height="120" decoding="async">
+          </div>
+        {% else %}
+          <div class="scan-preview pdf-preview">PDF</div>
+        {% endif %}
+        <div class="scan-meta">
+          <strong>{{ file.name }}</strong>
+          <span>{{ file.size }} · У кошику з {{ file.deleted_at }}</span>
+          <div class="scan-actions">
+            <form class="trash-action" method="post" action="{{ url_for('restore_trash', entry_id=file.id, page=page, per_page=per_page) }}">
+              <button type="submit">Відновити</button>
+            </form>
+            <form class="trash-action" method="post" action="{{ url_for('delete_trash', entry_id=file.id, page=page, per_page=per_page) }}"
+                  data-confirm-title="Видалити файл назавжди?" data-confirm-action="Видалити назавжди"
+                  data-confirm="Видалити назавжди «{{ file.name }}»? Відновити файл буде неможливо.">
+              <button class="danger" type="submit">Видалити назавжди</button>
+            </form>
+          </div>
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+  <nav class="pagination" aria-label="Сторінки кошика">
+    <div class="pagination-controls">
+      {% if page > 1 %}
+        <a class="pagination-link pagination-previous" href="{{ url_for('trash', page=page - 1, per_page=per_page) }}" aria-label="Попередня сторінка">‹</a>
+      {% endif %}
+      <form class="pagination-page" method="get" action="{{ url_for('trash') }}">
+        <input type="hidden" name="per_page" value="{{ per_page }}">
+        <input name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" required aria-label="Номер сторінки" style="width: {{ (page_count|string|length) + 5 }}ch">
+        <span>/ {{ page_count }}</span>
+      </form>
+      {% if page < page_count %}
+        <a class="pagination-link pagination-next" href="{{ url_for('trash', page=page + 1, per_page=per_page) }}" aria-label="Наступна сторінка">›</a>
+      {% endif %}
+    </div>
+    <form class="pagination-size" method="get" action="{{ url_for('trash') }}">
+      <label for="trash-per-page">На сторінці:</label>
+      <select id="trash-per-page" name="per_page">
+        {% for size in page_sizes %}
+          <option value="{{ size }}" {% if size == per_page %}selected{% endif %}>{{ size }}</option>
+        {% endfor %}
+      </select>
+    </form>
+  </nav>
+{% elif unavailable %}
+  <p class="hint">Список кошика недоступний.</p>
+{% else %}
+  <p class="hint">Кошик порожній.</p>
+{% endif %}
+<script>
+  const trashPageSize = document.querySelector("#trash-per-page");
+  if (trashPageSize) {
+    trashPageSize.addEventListener("change", () => trashPageSize.form.requestSubmit());
+  }
+  document.querySelectorAll(".trash-action").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      if (event.defaultPrevented) return;
+      form.querySelector("button[type='submit']").disabled = true;
     });
   });
 </script>
@@ -968,6 +1176,82 @@ def get_preview_version(stat: os.stat_result) -> str:
     )
 
 
+def get_trash_dir() -> Path:
+    directory = SCAN_DIR / ".trash"
+    if directory.is_symlink():
+        raise OSError("Папка кошика не може бути символічним посиланням.")
+    return directory
+
+
+def get_trash_file(entry_id: str) -> tuple[Path, datetime] | None:
+    if not re.fullmatch(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}", entry_id):
+        return None
+    try:
+        deleted_at = datetime.strptime(
+            entry_id.split("-")[0], "%Y%m%dT%H%M%S%fZ"
+        )
+    except ValueError:
+        return None
+    directory = get_trash_dir() / entry_id
+    if directory.is_symlink() or not directory.is_dir():
+        return None
+    contents = list(directory.iterdir())
+    if len(contents) != 1:
+        return None
+    path = contents[0]
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or path.suffix.lower() not in SCAN_FILE_EXTENSIONS
+    ):
+        return None
+    return path, deleted_at.replace(tzinfo=timezone.utc)
+
+
+def list_trash_files() -> list[dict[str, Any]]:
+    directory = get_trash_dir()
+    if not directory.exists():
+        return []
+    files: list[dict[str, Any]] = []
+    for entry in directory.iterdir():
+        result = get_trash_file(entry.name)
+        if result is None:
+            continue
+        path, deleted_at = result
+        stat = path.stat()
+        files.append(
+            {
+                "id": entry.name,
+                "name": path.name,
+                "size": format_file_size(stat.st_size),
+                "is_image": path.suffix.lower() in IMAGE_FILE_EXTENSIONS,
+                "preview_url": (
+                    url_for(
+                        "preview_trash", entry_id=entry.name,
+                        v=get_preview_version(stat),
+                    ) if path.suffix.lower() in IMAGE_FILE_EXTENSIONS else None
+                ),
+                "deleted_at": deleted_at.astimezone(KYIV_TIMEZONE).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
+        )
+    return sorted(files, key=lambda item: item["id"], reverse=True)
+
+
+def redirect_to_trash() -> Response:
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    return redirect(
+        url_for(
+            "trash",
+            page=max(1, request.args.get("page", 1, type=int)),
+            per_page=per_page,
+        )
+    )
+
+
 def list_scan_files(
     page: int = 1, per_page: int = SCAN_FILES_PER_PAGE
 ) -> tuple[list[dict[str, Any]], int, int]:
@@ -1020,8 +1304,22 @@ def list_scan_files(
     return files, page, page_count
 
 
-def remove_scan_previews(path: Path) -> None:
-    preview_dir = SCAN_DIR / "previews" / path.name
+def get_preview_dir(path: Path, trash_id: str | None = None) -> Path:
+    directory = SCAN_DIR / "previews"
+    directories = [directory]
+    if trash_id is not None:
+        if not re.fullmatch(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}", trash_id):
+            raise ValueError("Invalid trash ID")
+        directories.extend([directory / "trash", directory / "trash" / trash_id])
+    else:
+        directories.append(directory / path.name)
+    if any(item.is_symlink() for item in directories):
+        raise OSError("Папка прев'ю не може бути символічним посиланням.")
+    return directories[-1]
+
+
+def remove_scan_previews(path: Path, *, trash_id: str | None = None) -> None:
+    preview_dir = get_preview_dir(path, trash_id)
     if not preview_dir.is_dir():
         return
 
@@ -1030,11 +1328,18 @@ def remove_scan_previews(path: Path) -> None:
     preview_dir.rmdir()
 
 
-def get_scan_preview(path: Path) -> Path:
+def remove_trash_previews(path: Path, entry_id: str) -> None:
+    try:
+        remove_scan_previews(path, trash_id=entry_id)
+    except OSError:
+        app.logger.exception("Trash action completed, but preview cleanup failed")
+
+
+def get_scan_preview(path: Path, *, trash_id: str | None = None) -> Path:
     # Serializing generation bounds memory use when decoding large scans on the Pi.
     with preview_lock:
         stat = path.stat()
-        preview_dir = SCAN_DIR / "previews" / path.name
+        preview_dir = get_preview_dir(path, trash_id)
         preview_path = preview_dir / f"{get_preview_version(stat)}.jpg"
         if preview_path.is_file():
             return preview_path
@@ -1412,25 +1717,184 @@ def rotate_scan(filename: str) -> str:
 
 @app.route("/delete/<path:filename>", methods=["POST"])
 @login_required
-def delete_scan(filename: str) -> str:
+def delete_scan(filename: str) -> Response:
     global last_scan
 
-    requested_path = get_safe_scan_path(filename)
-
-    if requested_path is None:
-        return render_home(message="Файл не знайдено або ім'я файлу некоректне.", message_type="error")
-
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    destination = url_for(
+        "index",
+        page=max(1, request.args.get("page", 1, type=int)),
+        per_page=per_page,
+    )
     try:
         with preview_lock:
-            remove_scan_previews(requested_path)
-            requested_path.unlink()
+            requested_path = get_safe_scan_path(filename)
+            if requested_path is None or requested_path.is_symlink():
+                flash(
+                    "Файл не знайдено або ім'я файлу некоректне.", "error"
+                )
+                return redirect(destination)
+            timestamp = datetime.now(timezone.utc).strftime(
+                "%Y%m%dT%H%M%S%fZ"
+            )
+            directory = get_trash_dir() / f"{timestamp}-{secrets.token_hex(8)}"
+            directory.parent.mkdir(parents=True, exist_ok=True)
+            directory.mkdir()
+            try:
+                requested_path.rename(directory / requested_path.name)
+            except OSError:
+                directory.rmdir()
+                raise
+            if last_scan and last_scan.get("filename") == requested_path.name:
+                last_scan = None
+            try:
+                remove_scan_previews(requested_path)
+            except OSError:
+                app.logger.exception(
+                    "Scan moved to trash, but preview cleanup failed"
+                )
     except OSError as error:
-        return render_home(message=f"Не вдалося видалити файл: {error}", message_type="error")
+        flash(f"Не вдалося перемістити файл у кошик: {error}", "error")
+        return redirect(destination)
 
-    if last_scan and last_scan.get("filename") == requested_path.name:
-        last_scan = None
+    flash("Файл переміщено в кошик. Його можна відновити.", "success")
+    return redirect(destination)
 
-    return render_home(message="Файл видалено.", message_type="success")
+
+@app.route("/trash")
+@login_required
+def trash() -> str:
+    message = None
+    try:
+        with preview_lock:
+            files = list_trash_files()
+    except OSError as error:
+        files = []
+        message = f"Не вдалося прочитати кошик: {error}"
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    page_count = max(1, (len(files) + per_page - 1) // per_page)
+    page = min(max(1, request.args.get("page", 1, type=int)), page_count)
+    offset = (page - 1) * per_page
+    return render_page(
+        title="Кошик — Pi Scan Panel",
+        heading="Кошик",
+        body_template=TRASH_BODY,
+        message=message,
+        message_type="error",
+        files=files[offset:offset + per_page],
+        entry_ids=[file["id"] for file in files],
+        total=len(files),
+        unavailable=message is not None,
+        page=page,
+        page_count=page_count,
+        per_page=per_page,
+        page_sizes=SCAN_PAGE_SIZES,
+    )
+
+
+@app.route("/trash/<entry_id>/preview")
+@login_required
+def preview_trash(entry_id: str) -> Response:
+    try:
+        result = get_trash_file(entry_id)
+        if result is None or result[0].suffix.lower() not in IMAGE_FILE_EXTENSIONS:
+            return Response("Preview not found", status=404)
+        preview_path = get_scan_preview(result[0], trash_id=entry_id)
+    except FileNotFoundError:
+        return Response("Preview not found", status=404)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        app.logger.exception("Could not generate trash preview")
+        return Response("Preview unavailable", status=500)
+
+    response = send_from_directory(preview_path.parent, preview_path.name, max_age=0)
+    response.cache_control.private = True
+    return response
+
+
+@app.route("/trash/<entry_id>/restore", methods=["POST"])
+@login_required
+def restore_trash(entry_id: str) -> Response:
+    try:
+        with preview_lock:
+            result = get_trash_file(entry_id)
+            if result is None:
+                flash("Файл у кошику не знайдено.", "error")
+                return redirect_to_trash()
+            path, _ = result
+            destination = SCAN_DIR / path.name
+            # A hard link preserves metadata and cannot overwrite an existing name.
+            os.link(path, destination)
+            path.unlink()
+            remove_trash_previews(path, entry_id)
+            path.parent.rmdir()
+    except FileExistsError:
+        flash(
+            "Файл із таким ім'ям уже існує. "
+            "Відновлення скасовано без перезаписування.",
+            "error",
+        )
+    except OSError as error:
+        flash(
+            f"Не вдалося завершити відновлення файлу: {error}", "error"
+        )
+    else:
+        flash("Файл відновлено до списку сканів.", "success")
+    return redirect_to_trash()
+
+
+@app.route("/trash/<entry_id>/delete", methods=["POST"])
+@login_required
+def delete_trash(entry_id: str) -> Response:
+    try:
+        with preview_lock:
+            result = get_trash_file(entry_id)
+            if result is None:
+                flash("Файл у кошику не знайдено.", "error")
+                return redirect_to_trash()
+            path, _ = result
+            path.unlink()
+            remove_trash_previews(path, entry_id)
+            path.parent.rmdir()
+    except OSError as error:
+        flash(f"Не вдалося завершити видалення файлу: {error}", "error")
+    else:
+        flash("Файл видалено назавжди.", "success")
+    return redirect_to_trash()
+
+
+@app.route("/trash/empty", methods=["POST"])
+@login_required
+def empty_trash() -> Response:
+    deleted = 0
+    failed = 0
+    with preview_lock:
+        # Only remove entries included in the page the user confirmed.
+        for entry_id in set(request.form.getlist("entry_id")):
+            try:
+                result = get_trash_file(entry_id)
+                if result is None:
+                    continue
+                path, _ = result
+                path.unlink()
+                deleted += 1
+                remove_trash_previews(path, entry_id)
+                path.parent.rmdir()
+            except OSError:
+                failed += 1
+                app.logger.exception("Could not finish deleting a trash entry")
+    if failed:
+        flash(
+            f"Очищення завершено не повністю. Видалено файлів: {deleted}; "
+            f"помилок: {failed}.",
+            "error",
+        )
+    else:
+        flash(f"Видалено назавжди файлів: {deleted}.", "success")
+    return redirect_to_trash()
 
 
 @app.route("/print/<path:filename>", methods=["POST"])
