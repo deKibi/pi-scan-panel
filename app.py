@@ -150,11 +150,26 @@ BASE_TEMPLATE = """
       font-size: 0.98rem;
     }
 
-    .logout {
-      color: var(--accent);
-      font-weight: 650;
+    .logout,
+    .secondary-link {
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-weight: 400;
+      padding: 4px 0;
       text-decoration: none;
       white-space: nowrap;
+    }
+
+    .logout:hover,
+    .secondary-link:hover {
+      color: var(--text);
+      text-decoration: underline;
+    }
+
+    .logout:focus-visible,
+    .secondary-link:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
     }
 
     .panel {
@@ -290,6 +305,18 @@ BASE_TEMPLATE = """
       display: grid;
       gap: 12px;
       margin-top: 22px;
+    }
+
+    .scan-list-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 22px;
+    }
+
+    .scan-list-heading + .scan-list {
+      margin-top: 12px;
     }
 
     h2 {
@@ -569,11 +596,7 @@ BASE_TEMPLATE = """
         {% if subtitle %}<p class="subtitle">{{ subtitle }}</p>{% endif %}
       </div>
       {% if logged_in %}
-        <nav class="scan-actions" aria-label="Панель">
-          <a href="{{ url_for('index') }}">Скани</a>
-          <a href="{{ url_for('trash') }}">Кошик</a>
-          <a class="logout" href="{{ url_for('logout') }}">Вийти</a>
-        </nav>
+        <a class="logout" href="{{ url_for('logout') }}">Вийти</a>
       {% endif %}
     </div>
     <section class="panel">
@@ -661,9 +684,12 @@ HOME_BODY = """
 {% endif %}
 <p class="hint">A4, область сканування 210 × 297 мм. Файли зберігаються локально на Raspberry Pi.</p>
 <div class="printer-status" id="printer-status" data-status-url="{{ url_for('printer_status') }}" aria-live="polite">Завантажуємо статус принтера...</div>
+<div class="scan-list-heading">
+  <h2>Скани</h2>
+  <a class="secondary-link" href="{{ url_for('trash') }}">Кошик</a>
+</div>
 {% if scan_files %}
   <div class="scan-list">
-    <h2>Скани</h2>
     {% for file in scan_files %}
       <article class="scan-item">
         {% if file.is_image %}
@@ -872,6 +898,7 @@ HOME_BODY = """
 
 
 TRASH_BODY = """
+<a class="secondary-link" href="{{ url_for('index') }}">← До сканів</a>
 <p class="hint">Файли в кошику можна відновити. Автоматичне очищення вимкнене.</p>
 {% if files %}
   <form class="trash-action" method="post" action="{{ url_for('empty_trash') }}"
