@@ -348,10 +348,18 @@ BASE_TEMPLATE = """
       align-items: center;
       display: grid;
       gap: 8px;
-      grid-template-areas: "previous page next size";
-      grid-template-columns: 44px max-content 44px max-content;
-      justify-content: center;
+      grid-template-areas: ". navigation size";
+      grid-template-columns: minmax(0, 1fr) max-content minmax(0, 1fr);
       margin-top: 18px;
+    }
+
+    .pagination-controls {
+      align-items: center;
+      display: grid;
+      gap: 8px;
+      grid-area: navigation;
+      grid-template-areas: "previous page next";
+      grid-template-columns: 44px max-content 44px;
     }
 
     .pagination-link {
@@ -401,8 +409,8 @@ BASE_TEMPLATE = """
       display: flex;
       gap: 8px;
       grid-area: size;
-      justify-self: center;
-      margin-left: 12px;
+      justify-self: end;
+      margin: 0;
       white-space: nowrap;
     }
 
@@ -505,6 +513,18 @@ BASE_TEMPLATE = """
       white-space: pre-wrap;
     }
 
+    @media (max-width: 700px) {
+      .pagination {
+        grid-template-areas: "navigation" "size";
+        grid-template-columns: minmax(0, 1fr);
+        justify-items: center;
+      }
+
+      .pagination-size {
+        justify-self: center;
+      }
+    }
+
     @media (max-width: 560px) {
       .page {
         padding: 18px 12px 28px;
@@ -529,15 +549,6 @@ BASE_TEMPLATE = """
 
       .scan-item {
         grid-template-columns: 74px minmax(0, 1fr);
-      }
-
-      .pagination {
-        grid-template-areas: "previous page next" "size size size";
-        grid-template-columns: 44px max-content 44px;
-      }
-
-      .pagination-size {
-        margin-left: 0;
       }
     }
   </style>
@@ -675,21 +686,23 @@ HOME_BODY = """
     {% endfor %}
   </div>
     <nav class="pagination" aria-label="Сторінки сканів">
-      {% if page > 1 %}
-        <a class="pagination-link pagination-previous" href="{{ url_for('index', page=page - 1, per_page=per_page) }}" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></a>
-      {% else %}
-        <span class="pagination-link pagination-previous" role="link" aria-disabled="true" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></span>
-      {% endif %}
-      <form class="pagination-page" method="get" action="{{ url_for('index') }}">
-        <input type="hidden" name="per_page" value="{{ per_page }}">
-        <input id="scan-page" name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" step="1" required inputmode="numeric" aria-label="Номер сторінки" aria-describedby="pagination-total" title="Введіть номер сторінки та натисніть Enter" style="width: {{ (page_count|string|length) + 5 }}ch">
-        <span id="pagination-total">/ {{ page_count }}</span>
-      </form>
-      {% if page < page_count %}
-        <a class="pagination-link pagination-next" href="{{ url_for('index', page=page + 1, per_page=per_page) }}" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></a>
-      {% else %}
-        <span class="pagination-link pagination-next" role="link" aria-disabled="true" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></span>
-      {% endif %}
+      <div class="pagination-controls">
+        {% if page > 1 %}
+          <a class="pagination-link pagination-previous" href="{{ url_for('index', page=page - 1, per_page=per_page) }}" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></a>
+        {% else %}
+          <span class="pagination-link pagination-previous" role="link" aria-disabled="true" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></span>
+        {% endif %}
+        <form class="pagination-page" method="get" action="{{ url_for('index') }}">
+          <input type="hidden" name="per_page" value="{{ per_page }}">
+          <input id="scan-page" name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" step="1" required inputmode="numeric" aria-label="Номер сторінки" aria-describedby="pagination-total" title="Введіть номер сторінки та натисніть Enter" style="width: {{ (page_count|string|length) + 5 }}ch">
+          <span id="pagination-total">/ {{ page_count }}</span>
+        </form>
+        {% if page < page_count %}
+          <a class="pagination-link pagination-next" href="{{ url_for('index', page=page + 1, per_page=per_page) }}" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></a>
+        {% else %}
+          <span class="pagination-link pagination-next" role="link" aria-disabled="true" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></span>
+        {% endif %}
+      </div>
       <form class="pagination-size" method="get" action="{{ url_for('index') }}">
         <input type="hidden" name="page" value="1">
         <label for="scan-per-page">На сторінці:</label>
