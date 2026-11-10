@@ -345,11 +345,72 @@ BASE_TEMPLATE = """
 
     .pagination {
       align-items: center;
-      display: flex;
-      flex-wrap: wrap;
+      display: grid;
       gap: 12px;
+      grid-template-areas: "previous page next";
+      grid-template-columns: 124px max-content 124px;
       justify-content: center;
       margin-top: 18px;
+    }
+
+    .pagination-link {
+      align-items: center;
+      background: #ffffff;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      display: flex;
+      font-weight: 650;
+      justify-content: center;
+      min-height: 42px;
+      padding: 9px 13px;
+      text-decoration: none;
+    }
+
+    a.pagination-link:hover {
+      background: #f6f7f9;
+      border-color: var(--muted);
+    }
+
+    .pagination-link[aria-disabled="true"] {
+      background: #f9fafb;
+      color: var(--muted);
+    }
+
+    .pagination-previous {
+      grid-area: previous;
+    }
+
+    .pagination-next {
+      grid-area: next;
+    }
+
+    .pagination-page {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      grid-area: page;
+      justify-self: center;
+      margin: 0;
+      white-space: nowrap;
+    }
+
+    .pagination-page label {
+      color: var(--text);
+      display: inline;
+      font: inherit;
+    }
+
+    .pagination-page input {
+      min-height: 42px;
+      padding: 8px;
+      text-align: center;
+    }
+
+    .pagination-link:focus-visible,
+    .pagination-page input:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
     }
 
     .scan-meta {
@@ -452,6 +513,11 @@ BASE_TEMPLATE = """
 
       .scan-item {
         grid-template-columns: 74px minmax(0, 1fr);
+      }
+
+      .pagination {
+        grid-template-areas: "page page" "previous next";
+        grid-template-columns: repeat(2, minmax(0, 1fr));
       }
     }
   </style>
@@ -591,11 +657,19 @@ HOME_BODY = """
   {% if page_count > 1 %}
     <nav class="pagination" aria-label="Сторінки сканів">
       {% if page > 1 %}
-        <a class="button-link" href="{{ url_for('index', page=page - 1) }}">Попередня</a>
+        <a class="pagination-link pagination-previous" href="{{ url_for('index', page=page - 1) }}">Попередня</a>
+      {% else %}
+        <span class="pagination-link pagination-previous" role="link" aria-disabled="true">Попередня</span>
       {% endif %}
-      <span aria-current="page">Сторінка {{ page }} з {{ page_count }}</span>
+      <form class="pagination-page" method="get" action="{{ url_for('index') }}">
+        <label for="scan-page">Сторінка</label>
+        <input id="scan-page" name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" step="1" required inputmode="numeric" aria-describedby="pagination-total" title="Введіть номер сторінки та натисніть Enter" style="width: {{ (page_count|string|length) + 7 }}ch">
+        <span id="pagination-total">з {{ page_count }}</span>
+      </form>
       {% if page < page_count %}
-        <a class="button-link" href="{{ url_for('index', page=page + 1) }}">Наступна</a>
+        <a class="pagination-link pagination-next" href="{{ url_for('index', page=page + 1) }}">Наступна</a>
+      {% else %}
+        <span class="pagination-link pagination-next" role="link" aria-disabled="true">Наступна</span>
       {% endif %}
     </nav>
   {% endif %}
