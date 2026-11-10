@@ -82,3 +82,6 @@ sessions/
 # Python application data
 /data/rate_limits.sqlite3*
 /data/bot_settings.sqlite3*
+
+# Project Files
+demo-scans
