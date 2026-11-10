@@ -85,6 +85,8 @@ class TemplateTests(unittest.TestCase):
         self.assertIn('<strong>sample.pdf</strong>', html)
         self.assertIn('data-preview-src="/previews/sample.pdf?v=', html)
         self.assertIn('href="/files/sample.pdf"', html)
+        self.assertIn('action="/rotate/sample.pdf?', html)
+        self.assertIn("Повернути 90°", html)
         self.assertIn('src="/static/scan-previews.js"', html)
         self.assertIn('/static/scroll-lock.js', html)
         self.assertIn('id="confirm-dialog"', html)

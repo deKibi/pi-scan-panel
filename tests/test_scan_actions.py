@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 # Third-party Libraries
+import pypdfium2 as pdfium
 from PIL import Image
 
 # Custom Modules
@@ -42,6 +43,18 @@ class ScanActionTests(unittest.TestCase):
         self.assertEqual(response.mimetype, "application/json")
         return response.get_json()
 
+    def pdf(self, name: str = "scan.pdf") -> Path:
+        path = self.scan_dir / name
+        with pdfium.PdfDocument.new() as document:
+            for rotation in (0, 90, 180, 270):
+                page = document.new_page(40, 60)
+                try:
+                    page.set_rotation(rotation)
+                finally:
+                    page.close()
+            document.save(path)
+        return path
+
     def trash_id(self) -> str:
         return next(panel.get_trash_dir().iterdir()).name
 
@@ -66,6 +79,70 @@ class ScanActionTests(unittest.TestCase):
         data = self.post("/rotate/scan-0.png?page=2&per_page=10")
         self.assertEqual(data["file"]["id"], "scan-0.png")
         self.assertNotIn("list_html", data)
+
+    def test_pdf_rotation_updates_every_page_and_preview_url(self) -> None:
+        path = self.pdf()
+        urls = []
+        for turn in range(1, 5):
+            data = self.post("/rotate/scan.pdf?page=2&per_page=10")
+            self.assertTrue(data["success"])
+            self.assertNotIn("list_html", data)
+            self.assertEqual(data["file"]["id"], path.name)
+            self.assertIn("/previews/scan.pdf?v=", data["file"]["preview_url"])
+            urls.append(data["file"]["preview_url"])
+            with pdfium.PdfDocument(path) as document:
+                self.assertEqual(len(document), 4)
+                for index in range(len(document)):
+                    page = document[index]
+                    try:
+                        self.assertEqual(
+                            page.get_rotation(), ((index + turn) * 90) % 360
+                        )
+                    finally:
+                        page.close()
+        self.assertEqual(len(set(urls)), 4)
+        self.assertEqual(set(self.scan_dir.iterdir()), {path})
+
+    def test_pdf_save_failure_preserves_original_and_cleans_up(self) -> None:
+        path = self.pdf()
+        original = path.read_bytes()
+
+        def fail_save(document, destination):
+            Path(destination).write_bytes(b"incomplete PDF")
+            raise pdfium.PdfiumError("test save failure")
+
+        with patch.object(pdfium.PdfDocument, "save", fail_save):
+            data = self.post("/rotate/scan.pdf")
+        self.assertFalse(data["success"])
+        self.assertNotIn("file", data)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(set(self.scan_dir.iterdir()), {path})
+
+    def test_pdf_rotation_replace_failure_preserves_original(self) -> None:
+        path = self.pdf()
+        original = path.read_bytes()
+        with patch.object(Path, "replace", side_effect=OSError("test")):
+            data = self.post("/rotate/scan.pdf")
+        self.assertFalse(data["success"])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(set(self.scan_dir.iterdir()), {path})
+
+    def test_broken_pdf_rotation_preserves_original(self) -> None:
+        path = self.scan_dir / "broken.pdf"
+        original = b"%PDF-invalid"
+        path.write_bytes(original)
+        data = self.post("/rotate/broken.pdf")
+        self.assertFalse(data["success"])
+        self.assertNotIn("file", data)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(set(self.scan_dir.iterdir()), {path})
+
+    def test_html_pdf_rotation_remains_supported(self) -> None:
+        self.pdf()
+        response = self.client.post("/rotate/scan.pdf")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "text/html")
+        self.assertIn("Файл повернуто на 90°.", response.get_data(as_text=True))
 
     def test_html_rotation_and_print_remain_supported(self) -> None:
         self.image()
@@ -94,7 +171,7 @@ class ScanActionTests(unittest.TestCase):
                 self.assertEqual(data["message"], category)
                 self.assertNotIn("list_html", data)
 
-    def test_missing_files_and_invalid_rotation(self) -> None:
+    def test_missing_files_and_invalid_pdf(self) -> None:
         (self.scan_dir / "scan.pdf").write_bytes(b"%PDF-test")
         for url in (
             "/rotate/missing.png", "/print/missing.png", "/rotate/scan.pdf"
@@ -188,10 +265,13 @@ class ScanActionTests(unittest.TestCase):
 
     def test_expired_session_prevents_actions(self) -> None:
         path = self.image()
+        pdf_path = self.pdf()
+        original_pdf = pdf_path.read_bytes()
         with self.client.session_transaction() as session:
             session.clear()
         for url in (
-            "/rotate/scan.png", "/print/scan.png", "/delete/scan.png",
+            "/rotate/scan.png", "/rotate/scan.pdf", "/print/scan.png",
+            "/delete/scan.png",
             "/trash/missing/restore", "/trash/missing/delete", "/trash/empty",
         ):
             with self.subTest(url=url):
@@ -202,6 +282,7 @@ class ScanActionTests(unittest.TestCase):
                 self.assertFalse(response.get_json()["success"])
         with Image.open(path) as image:
             self.assertEqual(image.size, (40, 60))
+        self.assertEqual(pdf_path.read_bytes(), original_pdf)
         self.assertEqual(self.client.post("/rotate/scan.png").status_code, 302)
 
 
