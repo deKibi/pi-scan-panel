@@ -7,7 +7,7 @@ import re
 import secrets
 import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from flask import (
     Flask,
     Response,
+    flash,
     jsonify,
     redirect,
     render_template_string,
@@ -90,6 +91,7 @@ BASE_TEMPLATE = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }}</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
   <style>
     :root {
       color-scheme: light;
@@ -482,6 +484,12 @@ BASE_TEMPLATE = """
       color: var(--danger-text);
     }
 
+    .danger-button,
+    .danger-button:active {
+      background: var(--danger-bg);
+      color: var(--danger-text);
+    }
+
     .section-title {
       font-size: 1.15rem;
       letter-spacing: 0;
@@ -561,10 +569,17 @@ BASE_TEMPLATE = """
         {% if subtitle %}<p class="subtitle">{{ subtitle }}</p>{% endif %}
       </div>
       {% if logged_in %}
-        <a class="logout" href="{{ url_for('logout') }}">Вийти</a>
+        <nav class="scan-actions" aria-label="Панель">
+          <a href="{{ url_for('index') }}">Скани</a>
+          <a href="{{ url_for('trash') }}">Кошик</a>
+          <a class="logout" href="{{ url_for('logout') }}">Вийти</a>
+        </nav>
       {% endif %}
     </div>
     <section class="panel">
+      {% for category, text in get_flashed_messages(with_categories=true) %}
+        <p class="message {{ category }}" role="status">{{ text }}</p>
+      {% endfor %}
       {% if message %}
         <p class="message {{ message_type }}">{{ message }}</p>
       {% endif %}
@@ -678,7 +693,7 @@ HOME_BODY = """
               <button type="submit">Друк</button>
             </form>
             <form class="action-form delete-form" method="post" action="{{ file.delete_url }}">
-              <button class="danger" type="submit">Видалити</button>
+              <button class="danger" type="submit">У кошик</button>
             </form>
           </div>
         </div>
@@ -833,7 +848,7 @@ HOME_BODY = """
 
   document.querySelectorAll(".delete-form").forEach((form) => {
     form.addEventListener("submit", (event) => {
-      if (!confirm("Видалити цей файл?")) {
+      if (!confirm("Перемістити цей файл у кошик? Його можна буде відновити.")) {
         event.preventDefault();
       }
     });
@@ -850,6 +865,81 @@ HOME_BODY = """
       if (button) {
         button.disabled = true;
       }
+    });
+  });
+</script>
+"""
+
+
+TRASH_BODY = """
+<p class="hint">Файли в кошику можна відновити. Автоматичне очищення вимкнене.</p>
+{% if files %}
+  <form class="trash-action" method="post" action="{{ url_for('empty_trash') }}"
+        data-confirm="Остаточно видалити всі файли кошика ({{ total }})? Відновити їх буде неможливо.">
+    {% for entry_id in entry_ids %}
+      <input type="hidden" name="entry_id" value="{{ entry_id }}">
+    {% endfor %}
+    <button class="danger-button" type="submit">Очистити кошик ({{ total }})</button>
+  </form>
+  <div class="scan-list">
+    {% for file in files %}
+      <article class="scan-item" style="grid-template-columns: minmax(0, 1fr)">
+        <div class="scan-meta">
+          <strong>{{ file.name }}</strong>
+          <span>{{ file.size }} · У кошику з {{ file.deleted_at }}</span>
+          <div class="scan-actions">
+            <form class="trash-action" method="post" action="{{ url_for('restore_trash', entry_id=file.id, page=page, per_page=per_page) }}">
+              <button type="submit">Відновити</button>
+            </form>
+            <form class="trash-action" method="post" action="{{ url_for('delete_trash', entry_id=file.id, page=page, per_page=per_page) }}"
+                  data-confirm="Видалити назавжди «{{ file.name }}»? Відновити файл буде неможливо.">
+              <button class="danger" type="submit">Видалити назавжди</button>
+            </form>
+          </div>
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+  <nav class="pagination" aria-label="Сторінки кошика">
+    <div class="pagination-controls">
+      {% if page > 1 %}
+        <a class="pagination-link pagination-previous" href="{{ url_for('trash', page=page - 1, per_page=per_page) }}" aria-label="Попередня сторінка">‹</a>
+      {% endif %}
+      <form class="pagination-page" method="get" action="{{ url_for('trash') }}">
+        <input type="hidden" name="per_page" value="{{ per_page }}">
+        <input name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" required aria-label="Номер сторінки" style="width: {{ (page_count|string|length) + 5 }}ch">
+        <span>/ {{ page_count }}</span>
+      </form>
+      {% if page < page_count %}
+        <a class="pagination-link pagination-next" href="{{ url_for('trash', page=page + 1, per_page=per_page) }}" aria-label="Наступна сторінка">›</a>
+      {% endif %}
+    </div>
+    <form class="pagination-size" method="get" action="{{ url_for('trash') }}">
+      <label for="trash-per-page">На сторінці:</label>
+      <select id="trash-per-page" name="per_page">
+        {% for size in page_sizes %}
+          <option value="{{ size }}" {% if size == per_page %}selected{% endif %}>{{ size }}</option>
+        {% endfor %}
+      </select>
+    </form>
+  </nav>
+{% elif unavailable %}
+  <p class="hint">Список кошика недоступний.</p>
+{% else %}
+  <p class="hint">Кошик порожній.</p>
+{% endif %}
+<script>
+  const trashPageSize = document.querySelector("#trash-per-page");
+  if (trashPageSize) {
+    trashPageSize.addEventListener("change", () => trashPageSize.form.requestSubmit());
+  }
+  document.querySelectorAll(".trash-action").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      if (form.dataset.confirm && !confirm(form.dataset.confirm)) {
+        event.preventDefault();
+        return;
+      }
+      form.querySelector("button[type='submit']").disabled = true;
     });
   });
 </script>
@@ -968,6 +1058,74 @@ def get_preview_version(stat: os.stat_result) -> str:
     )
 
 
+def get_trash_dir() -> Path:
+    directory = SCAN_DIR / ".trash"
+    if directory.is_symlink():
+        raise OSError("Папка кошика не може бути символічним посиланням.")
+    return directory
+
+
+def get_trash_file(entry_id: str) -> tuple[Path, datetime] | None:
+    if not re.fullmatch(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}", entry_id):
+        return None
+    try:
+        deleted_at = datetime.strptime(
+            entry_id.split("-")[0], "%Y%m%dT%H%M%S%fZ"
+        )
+    except ValueError:
+        return None
+    directory = get_trash_dir() / entry_id
+    if directory.is_symlink() or not directory.is_dir():
+        return None
+    contents = list(directory.iterdir())
+    if len(contents) != 1:
+        return None
+    path = contents[0]
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or path.suffix.lower() not in SCAN_FILE_EXTENSIONS
+    ):
+        return None
+    return path, deleted_at.replace(tzinfo=timezone.utc)
+
+
+def list_trash_files() -> list[dict[str, Any]]:
+    directory = get_trash_dir()
+    if not directory.exists():
+        return []
+    files: list[dict[str, Any]] = []
+    for entry in directory.iterdir():
+        result = get_trash_file(entry.name)
+        if result is None:
+            continue
+        path, deleted_at = result
+        files.append(
+            {
+                "id": entry.name,
+                "name": path.name,
+                "size": format_file_size(path.stat().st_size),
+                "deleted_at": deleted_at.astimezone(KYIV_TIMEZONE).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
+        )
+    return sorted(files, key=lambda item: item["id"], reverse=True)
+
+
+def redirect_to_trash() -> Response:
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    return redirect(
+        url_for(
+            "trash",
+            page=max(1, request.args.get("page", 1, type=int)),
+            per_page=per_page,
+        )
+    )
+
+
 def list_scan_files(
     page: int = 1, per_page: int = SCAN_FILES_PER_PAGE
 ) -> tuple[list[dict[str, Any]], int, int]:
@@ -1022,6 +1180,8 @@ def list_scan_files(
 
 def remove_scan_previews(path: Path) -> None:
     preview_dir = SCAN_DIR / "previews" / path.name
+    if preview_dir.parent.is_symlink() or preview_dir.is_symlink():
+        raise OSError("Папка прев'ю не може бути символічним посиланням.")
     if not preview_dir.is_dir():
         return
 
@@ -1412,25 +1572,162 @@ def rotate_scan(filename: str) -> str:
 
 @app.route("/delete/<path:filename>", methods=["POST"])
 @login_required
-def delete_scan(filename: str) -> str:
+def delete_scan(filename: str) -> Response:
     global last_scan
 
-    requested_path = get_safe_scan_path(filename)
-
-    if requested_path is None:
-        return render_home(message="Файл не знайдено або ім'я файлу некоректне.", message_type="error")
-
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    destination = url_for(
+        "index",
+        page=max(1, request.args.get("page", 1, type=int)),
+        per_page=per_page,
+    )
     try:
         with preview_lock:
-            remove_scan_previews(requested_path)
-            requested_path.unlink()
+            requested_path = get_safe_scan_path(filename)
+            if requested_path is None or requested_path.is_symlink():
+                flash(
+                    "Файл не знайдено або ім'я файлу некоректне.", "error"
+                )
+                return redirect(destination)
+            timestamp = datetime.now(timezone.utc).strftime(
+                "%Y%m%dT%H%M%S%fZ"
+            )
+            directory = get_trash_dir() / f"{timestamp}-{secrets.token_hex(8)}"
+            directory.parent.mkdir(parents=True, exist_ok=True)
+            directory.mkdir()
+            try:
+                requested_path.rename(directory / requested_path.name)
+            except OSError:
+                directory.rmdir()
+                raise
+            if last_scan and last_scan.get("filename") == requested_path.name:
+                last_scan = None
+            try:
+                remove_scan_previews(requested_path)
+            except OSError:
+                app.logger.exception(
+                    "Scan moved to trash, but preview cleanup failed"
+                )
     except OSError as error:
-        return render_home(message=f"Не вдалося видалити файл: {error}", message_type="error")
+        flash(f"Не вдалося перемістити файл у кошик: {error}", "error")
+        return redirect(destination)
 
-    if last_scan and last_scan.get("filename") == requested_path.name:
-        last_scan = None
+    flash("Файл переміщено в кошик. Його можна відновити.", "success")
+    return redirect(destination)
 
-    return render_home(message="Файл видалено.", message_type="success")
+
+@app.route("/trash")
+@login_required
+def trash() -> str:
+    message = None
+    try:
+        with preview_lock:
+            files = list_trash_files()
+    except OSError as error:
+        files = []
+        message = f"Не вдалося прочитати кошик: {error}"
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    page_count = max(1, (len(files) + per_page - 1) // per_page)
+    page = min(max(1, request.args.get("page", 1, type=int)), page_count)
+    offset = (page - 1) * per_page
+    return render_page(
+        title="Кошик — Pi Scan Panel",
+        heading="Кошик",
+        body_template=TRASH_BODY,
+        message=message,
+        message_type="error",
+        files=files[offset:offset + per_page],
+        entry_ids=[file["id"] for file in files],
+        total=len(files),
+        unavailable=message is not None,
+        page=page,
+        page_count=page_count,
+        per_page=per_page,
+        page_sizes=SCAN_PAGE_SIZES,
+    )
+
+
+@app.route("/trash/<entry_id>/restore", methods=["POST"])
+@login_required
+def restore_trash(entry_id: str) -> Response:
+    try:
+        with preview_lock:
+            result = get_trash_file(entry_id)
+            if result is None:
+                flash("Файл у кошику не знайдено.", "error")
+                return redirect_to_trash()
+            path, _ = result
+            destination = SCAN_DIR / path.name
+            # A hard link preserves metadata and cannot overwrite an existing name.
+            os.link(path, destination)
+            path.unlink()
+            path.parent.rmdir()
+    except FileExistsError:
+        flash(
+            "Файл із таким ім'ям уже існує. "
+            "Відновлення скасовано без перезаписування.",
+            "error",
+        )
+    except OSError as error:
+        flash(
+            f"Не вдалося завершити відновлення файлу: {error}", "error"
+        )
+    else:
+        flash("Файл відновлено до списку сканів.", "success")
+    return redirect_to_trash()
+
+
+@app.route("/trash/<entry_id>/delete", methods=["POST"])
+@login_required
+def delete_trash(entry_id: str) -> Response:
+    try:
+        with preview_lock:
+            result = get_trash_file(entry_id)
+            if result is None:
+                flash("Файл у кошику не знайдено.", "error")
+                return redirect_to_trash()
+            path, _ = result
+            path.unlink()
+            path.parent.rmdir()
+    except OSError as error:
+        flash(f"Не вдалося завершити видалення файлу: {error}", "error")
+    else:
+        flash("Файл видалено назавжди.", "success")
+    return redirect_to_trash()
+
+
+@app.route("/trash/empty", methods=["POST"])
+@login_required
+def empty_trash() -> Response:
+    deleted = 0
+    failed = 0
+    with preview_lock:
+        # Only remove entries included in the page the user confirmed.
+        for entry_id in set(request.form.getlist("entry_id")):
+            try:
+                result = get_trash_file(entry_id)
+                if result is None:
+                    continue
+                path, _ = result
+                path.unlink()
+                deleted += 1
+                path.parent.rmdir()
+            except OSError:
+                failed += 1
+                app.logger.exception("Could not finish deleting a trash entry")
+    if failed:
+        flash(
+            f"Очищення завершено не повністю. Видалено файлів: {deleted}; "
+            f"помилок: {failed}.",
+            "error",
+        )
+    else:
+        flash(f"Видалено назавжди файлів: {deleted}.", "success")
+    return redirect_to_trash()
 
 
 @app.route("/print/<path:filename>", methods=["POST"])
