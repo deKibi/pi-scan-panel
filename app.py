@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import threading
 from datetime import datetime, timezone
 from functools import wraps
@@ -47,6 +48,7 @@ SCAN_FILES_PER_PAGE = 20
 SCAN_PAGE_SIZES = (10, 20, 50)
 PREVIEW_MAX_SIZE = (640, 640)
 PREVIEW_JPEG_QUALITY = 85
+PDF_PREVIEW_TIMEOUT_SECONDS = 10
 # Bump this when preview dimensions or encoding settings change.
 PREVIEW_CACHE_VERSION = 2
 KYIV_TIMEZONE = ZoneInfo("Europe/Kyiv")
@@ -451,6 +453,11 @@ BASE_TEMPLATE = """
       position: absolute;
       inset: 0;
       width: 100%;
+    }
+
+    .pdf-preview img {
+      object-fit: contain;
+      background: white;
     }
 
     .preview-error {
@@ -885,8 +892,8 @@ HOME_BODY = """
   <div class="scan-list">
     {% for file in scan_files %}
       <article class="scan-item">
-        {% if file.is_image %}
-          <a class="scan-preview" href="{{ file.open_url }}" target="_blank" rel="noopener">
+        {% if file.preview_url %}
+          <a class="scan-preview{% if not file.is_image %} pdf-preview{% endif %}" href="{{ file.open_url }}" target="_blank" rel="noopener">
             <svg class="preview-error" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
               <rect x="3" y="3" width="18" height="18" rx="2"></rect>
               <circle cx="8" cy="8" r="1.5"></circle>
@@ -1034,8 +1041,8 @@ TRASH_BODY = """
   <div class="scan-list">
     {% for file in files %}
       <article class="scan-item">
-        {% if file.is_image %}
-          <div class="scan-preview">
+        {% if file.preview_url %}
+          <div class="scan-preview{% if not file.is_image %} pdf-preview{% endif %}">
             <svg class="preview-error" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
               <rect x="3" y="3" width="18" height="18" rx="2"></rect>
               <circle cx="8" cy="8" r="1.5"></circle>
@@ -1258,11 +1265,15 @@ def list_trash_files() -> list[dict[str, Any]]:
         return []
     files: list[dict[str, Any]] = []
     for entry in directory.iterdir():
-        result = get_trash_file(entry.name)
-        if result is None:
+        try:
+            result = get_trash_file(entry.name)
+            if result is None:
+                continue
+            path, deleted_at = result
+            stat = path.stat()
+        except FileNotFoundError:
+            # Listing must tolerate a concurrent restore or permanent deletion.
             continue
-        path, deleted_at = result
-        stat = path.stat()
         files.append(
             {
                 "id": entry.name,
@@ -1273,7 +1284,7 @@ def list_trash_files() -> list[dict[str, Any]]:
                     url_for(
                         "preview_trash", entry_id=entry.name,
                         v=get_preview_version(stat),
-                    ) if path.suffix.lower() in IMAGE_FILE_EXTENSIONS else None
+                    )
                 ),
                 "deleted_at": deleted_at.astimezone(KYIV_TIMEZONE).strftime(
                     "%Y-%m-%d %H:%M:%S"
@@ -1330,7 +1341,7 @@ def list_scan_files(
                         "preview_scan",
                         filename=path.name,
                         v=get_preview_version(stat),
-                    ) if suffix in IMAGE_FILE_EXTENSIONS else None
+                    )
                 ),
                 "download_url": url_for("download_scan", filename=path.name),
                 "rotate_url": url_for(
@@ -1389,30 +1400,54 @@ def get_scan_preview(path: Path, *, trash_id: str | None = None) -> Path:
             return preview_path
 
         preview_dir.mkdir(parents=True, exist_ok=True)
-        with Image.open(path) as image:
-            image.thumbnail(PREVIEW_MAX_SIZE, Image.Resampling.LANCZOS)
-            if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
-                image = image.convert("RGBA")
-                thumbnail = Image.new("RGB", image.size, "white")
-                thumbnail.paste(image, mask=image.getchannel("A"))
-            else:
-                thumbnail = image.convert("RGB")
-
-            with NamedTemporaryFile(
-                dir=preview_dir, suffix=".jpg", delete=False
-            ) as preview_file:
-                temporary_path = Path(preview_file.name)
-                try:
-                    thumbnail.save(
-                        preview_file,
-                        format="JPEG",
-                        quality=PREVIEW_JPEG_QUALITY,
-                        optimize=True,
-                    )
+        with NamedTemporaryFile(
+            dir=preview_dir, suffix=".jpg", delete=False
+        ) as preview_file:
+            temporary_path = Path(preview_file.name)
+            try:
+                if path.suffix.lower() == ".pdf":
                     preview_file.close()
-                    temporary_path.replace(preview_path)
-                finally:
-                    temporary_path.unlink(missing_ok=True)
+                    # A process lets the timeout stop native PDF rendering.
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(Path(__file__).with_name("pdf_preview.py")),
+                            str(path.resolve()),
+                            str(temporary_path.resolve()),
+                            str(PREVIEW_MAX_SIZE[0]),
+                            str(PREVIEW_MAX_SIZE[1]),
+                            str(PREVIEW_JPEG_QUALITY),
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        check=True,
+                        timeout=PDF_PREVIEW_TIMEOUT_SECONDS,
+                    )
+                else:
+                    with Image.open(path) as image:
+                        image.thumbnail(
+                            PREVIEW_MAX_SIZE, Image.Resampling.LANCZOS
+                        )
+                        if (
+                            image.mode in {"RGBA", "LA"}
+                            or "transparency" in image.info
+                        ):
+                            image = image.convert("RGBA")
+                            thumbnail = Image.new("RGB", image.size, "white")
+                            thumbnail.paste(image, mask=image.getchannel("A"))
+                        else:
+                            thumbnail = image.convert("RGB")
+                        with thumbnail:
+                            thumbnail.save(
+                                preview_file,
+                                format="JPEG",
+                                quality=PREVIEW_JPEG_QUALITY,
+                                optimize=True,
+                            )
+                preview_file.close()
+                temporary_path.replace(preview_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
 
         for old_preview in preview_dir.glob("*.jpg"):
             if old_preview != preview_path:
@@ -1719,12 +1754,15 @@ def open_scan(filename: str) -> Response:
 @login_required
 def preview_scan(filename: str) -> Response:
     requested_path = get_safe_scan_path(filename)
-    if requested_path is None or requested_path.suffix.lower() not in IMAGE_FILE_EXTENSIONS:
+    if requested_path is None:
         return Response("Invalid filename", status=400)
 
     try:
         preview_path = get_scan_preview(requested_path)
-    except (OSError, ValueError, Image.DecompressionBombError):
+    except (
+        OSError, ValueError, Image.DecompressionBombError,
+        subprocess.CalledProcessError, subprocess.TimeoutExpired,
+    ):
         app.logger.exception("Could not generate scan preview")
         return Response("Preview unavailable", status=500)
 
@@ -1812,8 +1850,7 @@ def delete_scan(filename: str) -> Response:
 def trash() -> str:
     message = None
     try:
-        with preview_lock:
-            files = list_trash_files()
+        files = list_trash_files()
     except OSError as error:
         files = []
         message = f"Не вдалося прочитати кошик: {error}"
@@ -1845,12 +1882,15 @@ def trash() -> str:
 def preview_trash(entry_id: str) -> Response:
     try:
         result = get_trash_file(entry_id)
-        if result is None or result[0].suffix.lower() not in IMAGE_FILE_EXTENSIONS:
+        if result is None:
             return Response("Preview not found", status=404)
         preview_path = get_scan_preview(result[0], trash_id=entry_id)
     except FileNotFoundError:
         return Response("Preview not found", status=404)
-    except (OSError, ValueError, Image.DecompressionBombError):
+    except (
+        OSError, ValueError, Image.DecompressionBombError,
+        subprocess.CalledProcessError, subprocess.TimeoutExpired,
+    ):
         app.logger.exception("Could not generate trash preview")
         return Response("Preview unavailable", status=500)
 

@@ -171,11 +171,50 @@ The scan form supports rotation during scanning: no rotation, 90, 180, or 270 de
 
 The web panel can open, download, rotate 90 degrees, print, and delete saved scan files. Press rotate twice for 180 degrees. Rotation is supported for PNG and JPG files. PDF files can be opened, downloaded, printed, and deleted.
 
+Images and the first page of PDFs have cached JPEG previews in both the scan list and trash. Preview requests start after the page loads, only near the visible area, with at most two requests at a time. Generation is serialized; PDF rendering runs in a separate Python process with a 10-second timeout and a maximum output size of 640 × 640 pixels. Unreadable or password-protected PDFs show the preview error indicator.
+
+PDF rendering uses the `pypdfium2` Python dependency. Check that a binary wheel is available for the Raspberry Pi's OS and architecture before deployment; building PDFium from source on the Pi is not part of setup. After updating dependencies and code on the Pi, restart the running application using your existing launch method.
+
 Printing is available from each saved scan row with the `Друк` button. Files are sent to CUPS with:
 
 ```bash
 lp -d Canon_LBP2900 -o media=A4 -n 1 <scan-file>
 ```
+
+## Local Preview Checks
+
+Run the focused backend tests after installing `requirements.txt`:
+
+```bash
+python -m unittest discover -s tests -p 'test_previews.py' -v
+```
+
+These tests use synthetic credentials, bypass `.env` loading, and isolate scan files in temporary directories. They do not scan or print. If Node.js is available, verify the shared browser loading queue without additional packages:
+
+```bash
+node --test tests/test_scan_previews.js
+```
+
+Small portrait, landscape, and two-page PDFs are included in `tests/fixtures/pdf/`. To create an isolated local scan directory with these examples and an additional scan-like PDF of approximately 16 MB:
+
+```bash
+preview_scan_dir="$(mktemp -d -t pi-scan-preview)"
+python tests/generate_preview_pdfs.py --output "$preview_scan_dir" --large
+```
+
+For a local browser check, run with synthetic settings and dotenv loading disabled:
+
+```bash
+FLASK_SKIP_DOTENV=1 PYTHON_DOTENV_DISABLED=1 \
+SCANNER_USERNAME=preview SCANNER_PASSWORD=preview-local-only \
+SCANNER_SECRET_KEY=preview-local-session-key \
+SCANNER_SCAN_DIR="$preview_scan_dir" \
+PI_SCAN_PANEL_UPLOAD_DIR="$preview_scan_dir/uploads" \
+SCANNER_DEVICE=preview-test-only PI_SCAN_PANEL_PRINTER_NAME=preview-test-only \
+python -m flask --app app run --host 127.0.0.1 --port 8080
+```
+
+Open `http://127.0.0.1:8080` and log in using the synthetic credentials above. Verify that the two-page sample shows the red first page, landscape pages fit without cropping, and previews also work after moving a sample to trash. In browser developer tools, disable browser caching and check that preview requests begin after the main page loads; scroll through a longer list to confirm lazy loading and the two-request limit. Reload to check server cache reuse. On the Pi, compare cold and warm preview times and CPU/memory use with the large sample; desktop timings do not establish Pi performance.
 
 ## Health Check
 
