@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <main class="page">
+    <div class="topbar">
+      <div>
+        <h1>{{ heading }}</h1>
+        {% if subtitle %}<p class="subtitle">{{ subtitle }}</p>{% endif %}
+      </div>
+      {% if logged_in %}
+        <a class="logout" href="{{ url_for('logout') }}">Вийти</a>
+      {% endif %}
+    </div>
+    <section class="panel">
+      {% for category, text in get_flashed_messages(with_categories=true) %}
+        <p class="message {{ category }}" role="status">{{ text }}</p>
+      {% endfor %}
+      {% if message %}
+        <p class="message {{ message_type }}">{{ message }}</p>
+      {% endif %}
+      {% block content %}{% endblock %}
+    </section>
+  </main>
+  <footer class="site-footer">
+    <p>Developed by <a href="https://denys.kibitkin.com/" target="_blank" rel="noopener noreferrer">Denys Kibitkin</a></p>
+    {% if app_version or footer_text %}
+      <p>{% if app_version %}{{ app_version }}{% endif %}{% if app_version and footer_text %} · {% endif %}{{ footer_text }}</p>
+    {% endif %}
+  </footer>
+  {% if logged_in %}
+    <script src="{{ url_for('static', filename='scan-previews.js') }}" defer></script>
+    <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-message"></p>
+      <div class="actions">
+        <button class="cancel-button" id="confirm-cancel" type="button" autofocus>Скасувати</button>
+        <button class="danger-button" id="confirm-accept" type="button"></button>
+      </div>
+    </dialog>
+    <script type="module">
+      import { lockScroll } from "{{ url_for('static', filename='scroll-lock.js') }}";
+
+      const dialog = document.querySelector("#confirm-dialog");
+      const cancelButton = document.querySelector("#confirm-cancel");
+      const acceptButton = document.querySelector("#confirm-accept");
+      const approved = new WeakSet();
+      let pending = null;
+      let unlockScroll = null;
+      let backdropPointer = false;
+
+      function finish(confirmed) {
+        if (!pending) return;
+        const { form, submitter, opener } = pending;
+        pending = null;
+        if (dialog.open) dialog.close();
+        if (unlockScroll) unlockScroll();
+        unlockScroll = null;
+        if (opener && opener.isConnected) opener.focus({ preventScroll: true });
+        if (confirmed) {
+          approved.add(form);
+          form.requestSubmit(submitter || undefined);
+        }
+      }
+
+      document.addEventListener("submit", (event) => {
+        const form = event.target;
+        if (!form.matches("form[data-confirm]")) return;
+        if (approved.has(form)) {
+          approved.delete(form);
+          return;
+        }
+        event.preventDefault();
+        if (pending) return;
+        pending = {
+          form,
+          submitter: event.submitter,
+          opener: event.submitter || document.activeElement,
+        };
+        document.querySelector("#confirm-title").textContent = form.dataset.confirmTitle;
+        document.querySelector("#confirm-message").textContent = form.dataset.confirm;
+        acceptButton.textContent = form.dataset.confirmAction;
+        try {
+          if (typeof dialog.showModal !== "function") {
+            throw new Error("Modal dialogs are unavailable");
+          }
+          unlockScroll = lockScroll();
+          dialog.showModal();
+          cancelButton.focus({ preventScroll: true });
+        } catch (error) {
+          if (dialog.open) dialog.close();
+          if (unlockScroll) unlockScroll();
+          unlockScroll = null;
+          // Only opening failures use the system confirmation.
+          const confirmed = window.confirm(form.dataset.confirm);
+          // The browser ignores reentrant submission during the original event.
+          setTimeout(() => finish(confirmed), 0);
+        }
+      }, true);
+
+      cancelButton.addEventListener("click", () => finish(false));
+      acceptButton.addEventListener("click", () => finish(true));
+      dialog.addEventListener("cancel", (event) => {
+        event.preventDefault();
+        finish(false);
+      });
+      dialog.addEventListener("close", () => {
+        if (!dialog.open && unlockScroll) finish(false);
+      });
+      function outsideDialog(event) {
+        const bounds = dialog.getBoundingClientRect();
+        return event.clientX < bounds.left || event.clientX > bounds.right
+          || event.clientY < bounds.top || event.clientY > bounds.bottom;
+      }
+      dialog.addEventListener("pointerdown", (event) => {
+        backdropPointer = event.target === dialog && outsideDialog(event);
+      });
+      dialog.addEventListener("click", (event) => {
+        if (backdropPointer && event.target === dialog && outsideDialog(event)) {
+          finish(false);
+        }
+        backdropPointer = false;
+      });
+    </script>
+  {% endif %}
+</body>
+</html>
