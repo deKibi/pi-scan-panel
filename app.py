@@ -16,6 +16,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 # Third-party Libraries
+import pypdfium2 as pdfium
 from dotenv import load_dotenv
 from flask import (
     Flask,
@@ -421,7 +422,7 @@ def list_scan_files(
                 "mtime": stat.st_mtime,
                 "size": format_file_size(stat.st_size),
                 "is_image": suffix in IMAGE_FILE_EXTENSIONS,
-                "can_rotate": suffix in IMAGE_FILE_EXTENSIONS,
+                "can_rotate": suffix in SCAN_FILE_EXTENSIONS,
                 "open_url": url_for("open_scan", filename=path.name),
                 "preview_url": (
                     url_for(
@@ -653,6 +654,31 @@ def rotate_image_file(path: Path, degrees: int = 90) -> None:
             rotated_image.save(path)
 
 
+def rotate_pdf_file(path: Path, degrees: int = 90) -> None:
+    with preview_lock:
+        with NamedTemporaryFile(
+            dir=path.parent, suffix=".tmp", delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        try:
+            with pdfium.PdfDocument(path) as document:
+                if not len(document):
+                    raise ValueError("PDF не містить сторінок.")
+                for index in range(len(document)):
+                    page = document[index]
+                    try:
+                        page.set_rotation((page.get_rotation() + degrees) % 360)
+                    finally:
+                        page.close()
+                document.save(temporary_path)
+
+            # Replace only after saving and closing the complete document.
+            remove_scan_previews(path)
+            temporary_path.replace(path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+
 def apply_scan_rotation(path: Path, rotation: str) -> None:
     if rotation == "none":
         return
@@ -867,15 +893,12 @@ def rotate_scan(filename: str) -> str | Response:
             message="Файл не знайдено або ім'я файлу некоректне.",
             message_type="error",
         )
-    if requested_path.suffix.lower() not in IMAGE_FILE_EXTENSIONS:
-        return scan_action_response(
-            message="Поворот доступний тільки для PNG або JPG.",
-            message_type="error",
-        )
-
     try:
-        rotate_image_file(requested_path)
-    except OSError as error:
+        if requested_path.suffix.lower() == ".pdf":
+            rotate_pdf_file(requested_path)
+        else:
+            rotate_image_file(requested_path)
+    except (OSError, ValueError, pdfium.PdfiumError) as error:
         return scan_action_response(
             message=f"Не вдалося повернути файл: {error}", message_type="error"
         )

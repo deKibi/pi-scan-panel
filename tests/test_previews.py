@@ -119,6 +119,27 @@ class PreviewTests(unittest.TestCase):
         with Image.open(current) as image:
             self.assertGreater(image.width, image.height)
 
+    def test_pdf_rotation_refreshes_cached_preview(self) -> None:
+        path = self.copy_pdf("multipage")
+        previous = panel.get_scan_preview(path)
+        with Image.open(previous) as image:
+            self.assertLess(image.width, image.height)
+            expected_size = (image.height, image.width)
+
+        response = self.client.post(
+            f"/rotate/{path.name}", headers={"Accept": "application/json"}
+        )
+        self.assertTrue(response.get_json()["success"])
+        self.assertFalse(previous.exists())
+        preview = self.get_preview(response.get_json()["file"]["preview_url"])
+        width, height = self.assert_jpeg(preview)
+        self.assertGreater(width, height)
+        with Image.open(BytesIO(preview.data)) as image:
+            self.assertEqual(image.size, expected_size)
+            # The red first page remains the preview after rotating the PDF.
+            red, _, blue = image.getpixel((width // 2, height // 2))
+            self.assertGreater(red, blue + 20)
+
     def test_png_jpeg_and_transparency_still_work(self) -> None:
         for name, mode in (
             ("test.png", "RGB"), ("test.jpg", "RGB"), ("alpha.png", "RGBA")
