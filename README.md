@@ -163,6 +163,7 @@ If the systemd service file changed, run `sudo systemctl daemon-reload` before r
 - `PI_SCAN_PANEL_UPLOAD_DIR` - temporary upload directory for print jobs, defaults to `/home/pi/scans/uploads`.
 - `PI_SCAN_PANEL_MAX_UPLOAD_MB` - maximum upload size in MB, defaults to `25`.
 - `PI_SCAN_PANEL_VERSION` - optional release version without the `v` prefix, for example `0.5.0`. The footer displays `v0.5.0`; leave empty or unset to hide the version. Update it manually for each release and restart the application after changing it.
+- `PI_SCAN_PANEL_FOOTER_TEXT` - optional plain text displayed beside the version, for example `Canada` or `Developed in Canada`. Leave empty or unset to hide the text. It can also be shown without a version. Restart the application after changing it.
 
 ## Scan File Actions
 

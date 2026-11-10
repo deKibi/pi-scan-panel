@@ -71,6 +71,7 @@ load_dotenv()
 APP_USERNAME = os.getenv("SCANNER_USERNAME")
 APP_PASSWORD = os.getenv("SCANNER_PASSWORD")
 APP_VERSION = os.getenv("PI_SCAN_PANEL_VERSION", "").strip()
+APP_FOOTER_TEXT = os.getenv("PI_SCAN_PANEL_FOOTER_TEXT", "").strip()
 SCAN_DIR = Path(os.getenv("SCANNER_SCAN_DIR", DEFAULT_SCAN_DIR)).expanduser()
 SCANNER_DEVICE = os.getenv("SCANNER_DEVICE")
 PRINTER_NAME = os.getenv("PI_SCAN_PANEL_PRINTER_NAME", DEFAULT_PRINTER_NAME)
@@ -702,7 +703,9 @@ BASE_TEMPLATE = """
   </main>
   <footer class="site-footer">
     <p>Developed by <a href="https://denys.kibitkin.com/" target="_blank" rel="noopener noreferrer">Denys Kibitkin</a></p>
-    <p>{% if app_version %}v{{ app_version }} · {% endif %}Developed in Canada</p>
+    {% if app_version or footer_text %}
+      <p>{% if app_version %}v{{ app_version }}{% endif %}{% if app_version and footer_text %} · {% endif %}{{ footer_text }}</p>
+    {% endif %}
   </footer>
   {% if logged_in %}
     <script src="{{ url_for('static', filename='scan-previews.js') }}" defer></script>
@@ -1120,6 +1123,7 @@ def render_page(
         subtitle=subtitle,
         logged_in=session.get("logged_in"),
         app_version=APP_VERSION,
+        footer_text=APP_FOOTER_TEXT,
         message=message,
         message_type=message_type,
         body=body,
