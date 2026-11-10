@@ -10,6 +10,7 @@ import threading
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -41,6 +42,12 @@ DEFAULT_PRINTER_NAME = "Canon_LBP2900"
 DEFAULT_UPLOAD_DIR = "/home/pi/scans/uploads"
 SCAN_TIMEOUT_SECONDS = 900
 PRINT_TIMEOUT_SECONDS = 60
+SCAN_FILES_PER_PAGE = 20
+SCAN_PAGE_SIZES = (10, 20, 50)
+PREVIEW_MAX_SIZE = (640, 640)
+PREVIEW_JPEG_QUALITY = 85
+# Bump this when preview dimensions or encoding settings change.
+PREVIEW_CACHE_VERSION = 2
 KYIV_TIMEZONE = ZoneInfo("Europe/Kyiv")
 SCAN_FILE_EXTENSIONS: frozenset[str] = frozenset({".png", ".pdf", ".jpg", ".jpeg"})
 IMAGE_FILE_EXTENSIONS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg"})
@@ -54,6 +61,7 @@ UPLOAD_MIME_TYPES: dict[str, frozenset[str]] = {
 
 # Runtime state
 command_lock = threading.Lock()
+preview_lock = threading.Lock()
 last_scan: dict[str, str] | None = None
 
 
@@ -309,6 +317,7 @@ BASE_TEMPLATE = """
       font-weight: 800;
       justify-content: center;
       overflow: hidden;
+      position: relative;
       text-decoration: none;
       width: 100%;
     }
@@ -317,7 +326,115 @@ BASE_TEMPLATE = """
       display: block;
       height: 100%;
       object-fit: cover;
+      opacity: 0;
+      position: absolute;
+      inset: 0;
       width: 100%;
+    }
+
+    .preview-error {
+      display: none;
+    }
+
+    .scan-preview.is-loaded img {
+      opacity: 1;
+    }
+
+    .scan-preview.is-error .preview-error {
+      display: block;
+    }
+
+    .pagination {
+      align-items: center;
+      display: grid;
+      gap: 8px;
+      grid-template-areas: ". navigation size";
+      grid-template-columns: minmax(0, 1fr) max-content minmax(0, 1fr);
+      margin-top: 18px;
+    }
+
+    .pagination-controls {
+      align-items: center;
+      display: grid;
+      gap: 8px;
+      grid-area: navigation;
+      grid-template-areas: "previous page next";
+      grid-template-columns: 44px max-content 44px;
+    }
+
+    .pagination-link {
+      align-items: center;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      color: var(--text);
+      display: flex;
+      font-size: 1.5rem;
+      justify-content: center;
+      min-height: 42px;
+      padding: 4px;
+      text-decoration: none;
+    }
+
+    a.pagination-link:hover {
+      background: #f6f7f9;
+      border-color: var(--muted);
+    }
+
+    .pagination-link[aria-disabled="true"] {
+      color: var(--muted);
+      opacity: 0.45;
+    }
+
+    .pagination-previous {
+      grid-area: previous;
+    }
+
+    .pagination-next {
+      grid-area: next;
+    }
+
+    .pagination-page {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      grid-area: page;
+      justify-self: center;
+      margin: 0;
+      white-space: nowrap;
+    }
+
+    .pagination-size {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      grid-area: size;
+      justify-self: end;
+      margin: 0;
+      white-space: nowrap;
+    }
+
+    .pagination-size label {
+      display: inline;
+      font: inherit;
+    }
+
+    .pagination-page input,
+    .pagination-size select {
+      min-height: 42px;
+      padding: 8px;
+      width: auto;
+    }
+
+    .pagination-page input {
+      text-align: center;
+    }
+
+    .pagination-link:focus-visible,
+    .pagination-page input:focus-visible,
+    .pagination-size select:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
     }
 
     .scan-meta {
@@ -394,6 +511,18 @@ BASE_TEMPLATE = """
       margin-top: 14px;
       padding: 12px;
       white-space: pre-wrap;
+    }
+
+    @media (max-width: 700px) {
+      .pagination {
+        grid-template-areas: "navigation" "size";
+        grid-template-columns: minmax(0, 1fr);
+        justify-items: center;
+      }
+
+      .pagination-size {
+        justify-self: center;
+      }
     }
 
     @media (max-width: 560px) {
@@ -516,7 +645,7 @@ HOME_BODY = """
   </div>
 {% endif %}
 <p class="hint">A4, область сканування 210 × 297 мм. Файли зберігаються локально на Raspberry Pi.</p>
-<div class="printer-status">{{ printer_status }}</div>
+<div class="printer-status" id="printer-status" data-status-url="{{ url_for('printer_status') }}" aria-live="polite">Завантажуємо статус принтера...</div>
 {% if scan_files %}
   <div class="scan-list">
     <h2>Скани</h2>
@@ -524,7 +653,12 @@ HOME_BODY = """
       <article class="scan-item">
         {% if file.is_image %}
           <a class="scan-preview" href="{{ file.open_url }}" target="_blank" rel="noopener">
-            <img src="{{ file.open_url }}" alt="{{ file.name }}">
+            <svg class="preview-error" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+              <circle cx="8" cy="8" r="1.5"></circle>
+              <path d="m21 15-5-5L5 21M3 3l18 18"></path>
+            </svg>
+            <img data-preview-src="{{ file.preview_url }}" alt="{{ file.name }}" width="96" height="120" decoding="async">
           </a>
         {% else %}
           <a class="scan-preview pdf-preview" href="{{ file.open_url }}" target="_blank" rel="noopener">PDF</a>
@@ -551,10 +685,127 @@ HOME_BODY = """
       </article>
     {% endfor %}
   </div>
+    <nav class="pagination" aria-label="Сторінки сканів">
+      <div class="pagination-controls">
+        {% if page > 1 %}
+          <a class="pagination-link pagination-previous" href="{{ url_for('index', page=page - 1, per_page=per_page) }}" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></a>
+        {% else %}
+          <span class="pagination-link pagination-previous" role="link" aria-disabled="true" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></span>
+        {% endif %}
+        <form class="pagination-page" method="get" action="{{ url_for('index') }}">
+          <input type="hidden" name="per_page" value="{{ per_page }}">
+          <input id="scan-page" name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" step="1" required inputmode="numeric" aria-label="Номер сторінки" aria-describedby="pagination-total" title="Введіть номер сторінки та натисніть Enter" style="width: {{ (page_count|string|length) + 5 }}ch">
+          <span id="pagination-total">/ {{ page_count }}</span>
+        </form>
+        {% if page < page_count %}
+          <a class="pagination-link pagination-next" href="{{ url_for('index', page=page + 1, per_page=per_page) }}" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></a>
+        {% else %}
+          <span class="pagination-link pagination-next" role="link" aria-disabled="true" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></span>
+        {% endif %}
+      </div>
+      <form class="pagination-size" method="get" action="{{ url_for('index') }}">
+        <input type="hidden" name="page" value="1">
+        <label for="scan-per-page">На сторінці:</label>
+        <select id="scan-per-page" name="per_page">
+          {% for size in page_sizes %}
+            <option value="{{ size }}" {% if size == per_page %}selected{% endif %}>{{ size }}</option>
+          {% endfor %}
+        </select>
+      </form>
+    </nav>
 {% else %}
   <p class="hint">Поки немає збережених сканів.</p>
 {% endif %}
 <script>
+  const pageSizeSelect = document.querySelector("#scan-per-page");
+  if (pageSizeSelect) {
+    pageSizeSelect.addEventListener("change", () => {
+      pageSizeSelect.form.requestSubmit();
+    });
+  }
+
+  // Start image requests after the document loads so previews do not hold up the page.
+  window.addEventListener("load", () => {
+    const previewQueue = new Set();
+    const previewMargin = 200;
+    const maxActivePreviews = 2;
+    let activePreviews = 0;
+
+    function loadNextPreviews() {
+      const candidates = [...previewQueue].map((image) => {
+        const bounds = image.getBoundingClientRect();
+        return {
+          image,
+          top: bounds.top,
+          bottom: bounds.bottom,
+          visible: bounds.bottom > 0 && bounds.top < window.innerHeight,
+        };
+      }).filter((item) => (
+        item.bottom >= -previewMargin && item.top <= window.innerHeight + previewMargin
+      )).sort((first, second) => (
+        Number(second.visible) - Number(first.visible) || first.top - second.top
+      ));
+
+      for (const { image, visible } of candidates) {
+        if (activePreviews >= maxActivePreviews) {
+          break;
+        }
+
+        previewQueue.delete(image);
+        previewObserver.unobserve(image);
+        activePreviews += 1;
+        image.fetchPriority = visible ? "high" : "low";
+
+        function finishPreview(loaded) {
+          const preview = image.closest(".scan-preview");
+          if (loaded) {
+            preview.classList.add("is-loaded");
+          } else {
+            preview.classList.add("is-error");
+            preview.title = "Прев’ю недоступне. Відкрити оригінал.";
+            preview.setAttribute("aria-label", `${image.alt}: ${preview.title}`);
+          }
+          activePreviews -= 1;
+          loadNextPreviews();
+        }
+
+        image.addEventListener("load", () => finishPreview(true), { once: true });
+        image.addEventListener("error", () => finishPreview(false), { once: true });
+        image.src = image.dataset.previewSrc;
+      }
+    }
+
+    const previewObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          previewQueue.add(entry.target);
+        } else {
+          previewQueue.delete(entry.target);
+        }
+      }
+      loadNextPreviews();
+    }, { rootMargin: `${previewMargin}px 0px` });
+
+    document.querySelectorAll("img[data-preview-src]").forEach((image) => {
+      previewObserver.observe(image);
+    });
+
+    const printerStatus = document.querySelector("#printer-status");
+    fetch(printerStatus.dataset.statusUrl, { cache: "no-store" })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error("Printer status request failed");
+        }
+        return response.json();
+      })
+      .then((data) => {
+        printerStatus.textContent = data.status;
+      })
+      .catch(() => {
+        printerStatus.textContent = "Статус принтера недоступний.";
+      });
+  }, { once: true });
+
   const scanForm = document.querySelector(".scan-form");
   const scanButton = scanForm.querySelector("button[type='submit']");
   const scanStatus = document.querySelector("#scan-status");
@@ -710,17 +961,32 @@ def get_safe_scan_path(filename: str) -> Path | None:
     return requested_path
 
 
-def list_scan_files() -> list[dict[str, Any]]:
+def get_preview_version(stat: os.stat_result) -> str:
+    return (
+        f"{PREVIEW_CACHE_VERSION}-{stat.st_mtime_ns}-"
+        f"{stat.st_ctime_ns}-{stat.st_size}"
+    )
+
+
+def list_scan_files(
+    page: int = 1, per_page: int = SCAN_FILES_PER_PAGE
+) -> tuple[list[dict[str, Any]], int, int]:
     if not SCAN_DIR.is_dir():
-        return []
+        return [], 1, 1
 
+    scan_paths: list[tuple[Path, os.stat_result]] = []
+    with os.scandir(SCAN_DIR) as entries:
+        for entry in entries:
+            if Path(entry.name).suffix.lower() in SCAN_FILE_EXTENSIONS and entry.is_file():
+                scan_paths.append((Path(entry.path), entry.stat()))
+
+    scan_paths.sort(key=lambda item: item[1].st_mtime_ns, reverse=True)
+    page_count = max(1, (len(scan_paths) + per_page - 1) // per_page)
+    page = min(max(1, page), page_count)
+    offset = (page - 1) * per_page
     files: list[dict[str, Any]] = []
-    for path in SCAN_DIR.iterdir():
+    for path, stat in scan_paths[offset:offset + per_page]:
         suffix = path.suffix.lower()
-        if not path.is_file() or suffix not in SCAN_FILE_EXTENSIONS:
-            continue
-
-        stat = path.stat()
         completed_at = datetime.fromtimestamp(stat.st_mtime, tz=KYIV_TIMEZONE)
         files.append(
             {
@@ -731,14 +997,78 @@ def list_scan_files() -> list[dict[str, Any]]:
                 "is_image": suffix in IMAGE_FILE_EXTENSIONS,
                 "can_rotate": suffix in IMAGE_FILE_EXTENSIONS,
                 "open_url": url_for("open_scan", filename=path.name),
+                "preview_url": (
+                    url_for(
+                        "preview_scan",
+                        filename=path.name,
+                        v=get_preview_version(stat),
+                    ) if suffix in IMAGE_FILE_EXTENSIONS else None
+                ),
                 "download_url": url_for("download_scan", filename=path.name),
-                "rotate_url": url_for("rotate_scan", filename=path.name),
-                "print_url": url_for("print_scan", filename=path.name),
-                "delete_url": url_for("delete_scan", filename=path.name),
+                "rotate_url": url_for(
+                    "rotate_scan", filename=path.name, page=page, per_page=per_page
+                ),
+                "print_url": url_for(
+                    "print_scan", filename=path.name, page=page, per_page=per_page
+                ),
+                "delete_url": url_for(
+                    "delete_scan", filename=path.name, page=page, per_page=per_page
+                ),
             }
         )
 
-    return sorted(files, key=lambda item: item["mtime"], reverse=True)
+    return files, page, page_count
+
+
+def remove_scan_previews(path: Path) -> None:
+    preview_dir = SCAN_DIR / "previews" / path.name
+    if not preview_dir.is_dir():
+        return
+
+    for preview_path in preview_dir.glob("*.jpg"):
+        preview_path.unlink(missing_ok=True)
+    preview_dir.rmdir()
+
+
+def get_scan_preview(path: Path) -> Path:
+    # Serializing generation bounds memory use when decoding large scans on the Pi.
+    with preview_lock:
+        stat = path.stat()
+        preview_dir = SCAN_DIR / "previews" / path.name
+        preview_path = preview_dir / f"{get_preview_version(stat)}.jpg"
+        if preview_path.is_file():
+            return preview_path
+
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        with Image.open(path) as image:
+            image.thumbnail(PREVIEW_MAX_SIZE, Image.Resampling.LANCZOS)
+            if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+                image = image.convert("RGBA")
+                thumbnail = Image.new("RGB", image.size, "white")
+                thumbnail.paste(image, mask=image.getchannel("A"))
+            else:
+                thumbnail = image.convert("RGB")
+
+            with NamedTemporaryFile(
+                dir=preview_dir, suffix=".jpg", delete=False
+            ) as preview_file:
+                temporary_path = Path(preview_file.name)
+                try:
+                    thumbnail.save(
+                        preview_file,
+                        format="JPEG",
+                        quality=PREVIEW_JPEG_QUALITY,
+                        optimize=True,
+                    )
+                    preview_file.close()
+                    temporary_path.replace(preview_path)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+
+        for old_preview in preview_dir.glob("*.jpg"):
+            if old_preview != preview_path:
+                old_preview.unlink(missing_ok=True)
+        return preview_path
 
 
 def get_printer_status() -> str:
@@ -842,12 +1172,14 @@ def save_uploaded_print_file() -> tuple[Path | None, str | None]:
 
 
 def rotate_image_file(path: Path, degrees: int = 90) -> None:
-    with Image.open(path) as image:
-        rotated_image = image.rotate(-degrees, expand=True)
-        if path.suffix.lower() in {".jpg", ".jpeg"} and rotated_image.mode in {"RGBA", "P"}:
-            rotated_image = rotated_image.convert("RGB")
+    with preview_lock:
+        remove_scan_previews(path)
+        with Image.open(path) as image:
+            rotated_image = image.rotate(-degrees, expand=True)
+            if path.suffix.lower() in {".jpg", ".jpeg"} and rotated_image.mode in {"RGBA", "P"}:
+                rotated_image = rotated_image.convert("RGB")
 
-        rotated_image.save(path)
+            rotated_image.save(path)
 
 
 def apply_scan_rotation(path: Path, rotation: str) -> None:
@@ -907,6 +1239,12 @@ def render_home(
     message_type: str = "success",
     filename: str | None = None,
 ) -> str:
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    scan_files, page, page_count = list_scan_files(
+        request.args.get("page", 1, type=int), per_page
+    )
     return render_page(
         title="Pi Scan Panel",
         heading="Pi Scan Panel",
@@ -927,8 +1265,11 @@ def render_home(
         },
         busy=command_lock.locked(),
         filename=filename,
-        scan_files=list_scan_files(),
-        printer_status=get_printer_status(),
+        scan_files=scan_files,
+        page=page,
+        page_count=page_count,
+        per_page=per_page,
+        page_sizes=SCAN_PAGE_SIZES,
     )
 
 
@@ -1025,6 +1366,32 @@ def open_scan(filename: str) -> Response:
     return send_from_directory(SCAN_DIR, requested_path.name, as_attachment=False)
 
 
+@app.route("/previews/<path:filename>")
+@login_required
+def preview_scan(filename: str) -> Response:
+    requested_path = get_safe_scan_path(filename)
+    if requested_path is None or requested_path.suffix.lower() not in IMAGE_FILE_EXTENSIONS:
+        return Response("Invalid filename", status=400)
+
+    try:
+        preview_path = get_scan_preview(requested_path)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        app.logger.exception("Could not generate scan preview")
+        return Response("Preview unavailable", status=500)
+
+    response = send_from_directory(preview_path.parent, preview_path.name, max_age=0)
+    response.cache_control.private = True
+    return response
+
+
+@app.route("/printer-status")
+@login_required
+def printer_status() -> Response:
+    response = jsonify({"status": get_printer_status()})
+    response.cache_control.no_store = True
+    return response
+
+
 @app.route("/rotate/<path:filename>", methods=["POST"])
 @login_required
 def rotate_scan(filename: str) -> str:
@@ -1054,7 +1421,9 @@ def delete_scan(filename: str) -> str:
         return render_home(message="Файл не знайдено або ім'я файлу некоректне.", message_type="error")
 
     try:
-        requested_path.unlink()
+        with preview_lock:
+            remove_scan_previews(requested_path)
+            requested_path.unlink()
     except OSError as error:
         return render_home(message=f"Не вдалося видалити файл: {error}", message_type="error")
 

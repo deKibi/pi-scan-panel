@@ -141,6 +141,17 @@ sudo systemctl start pi-scan-panel
 sudo systemctl status pi-scan-panel
 ```
 
+## Update
+
+After updating the application files on the production Raspberry Pi, restart the service and check its status:
+
+```bash
+sudo systemctl restart pi-scan-panel
+sudo systemctl status pi-scan-panel --no-pager
+```
+
+If the systemd service file changed, run `sudo systemctl daemon-reload` before restarting.
+
 ## Configuration
 
 - `SCANNER_USERNAME` - login for the web panel.
