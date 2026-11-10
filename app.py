@@ -150,7 +150,13 @@ BASE_TEMPLATE = """
       font-size: 0.98rem;
     }
 
-    .logout,
+    .logout {
+      color: var(--accent);
+      font-weight: 650;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+
     .secondary-link {
       color: var(--muted);
       font-size: 0.9rem;
@@ -162,8 +168,16 @@ BASE_TEMPLATE = """
 
     .logout:hover,
     .secondary-link:hover {
-      color: var(--text);
       text-decoration: underline;
+    }
+
+    .secondary-link:hover {
+      color: var(--text);
+    }
+
+    .trash-link,
+    .trash-link:hover {
+      color: var(--danger-text);
     }
 
     .logout:focus-visible,
@@ -686,7 +700,7 @@ HOME_BODY = """
 <div class="printer-status" id="printer-status" data-status-url="{{ url_for('printer_status') }}" aria-live="polite">Завантажуємо статус принтера...</div>
 <div class="scan-list-heading">
   <h2>Скани</h2>
-  <a class="secondary-link" href="{{ url_for('trash') }}">Кошик</a>
+  <a class="secondary-link trash-link" href="{{ url_for('trash') }}">Кошик</a>
 </div>
 {% if scan_files %}
   <div class="scan-list">
