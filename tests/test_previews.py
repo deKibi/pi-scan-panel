@@ -31,7 +31,7 @@ with (
         "PI_SCAN_PANEL_MAX_UPLOAD_MB": "25",
     }),
 ):
-    panel = importlib.import_module("app")
+    panel = importlib.import_module("pi_scan_panel.web")
 
 
 class PreviewTests(unittest.TestCase):
@@ -193,7 +193,7 @@ class PreviewTests(unittest.TestCase):
         )
         started = time.monotonic()
         with (
-            patch.object(panel, "__file__", str(self.scan_dir / "app.py")),
+            patch.object(panel, "__file__", str(self.scan_dir / "web.py")),
             patch.object(panel, "PDF_PREVIEW_TIMEOUT_SECONDS", 0.25),
             self.assertLogs(panel.app.logger, level="ERROR"),
         ):

@@ -7,7 +7,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const source = fs.readFileSync(
-  path.join(__dirname, "../static/scan-previews.js"), "utf8"
+  path.join(__dirname, "../pi_scan_panel/static/scan-previews.js"), "utf8"
 );
 
 function setup(tops) {

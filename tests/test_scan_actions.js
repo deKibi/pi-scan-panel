@@ -6,8 +6,8 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const source = fs.readFileSync(path.join(__dirname, "../static/scan-actions.js"), "utf8");
-const base = fs.readFileSync(path.join(__dirname, "../templates/base.html"), "utf8");
+const source = fs.readFileSync(path.join(__dirname, "../pi_scan_panel/static/scan-actions.js"), "utf8");
+const base = fs.readFileSync(path.join(__dirname, "../pi_scan_panel/templates/base.html"), "utf8");
 const confirmation = base.match(/<script type="module">([\s\S]*?)<\/script>/)[1]
   .replace(/import \{ lockScroll \} from .*?;/, "");
 

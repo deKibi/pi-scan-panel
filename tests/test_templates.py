@@ -19,7 +19,8 @@ with (
         "PI_SCAN_PANEL_MAX_UPLOAD_MB": "25",
     }),
 ):
-    panel = importlib.import_module("app")
+    panel = importlib.import_module("pi_scan_panel.web")
+    launcher = importlib.import_module("app")
 
 
 class TemplateTests(unittest.TestCase):
@@ -54,6 +55,9 @@ class TemplateTests(unittest.TestCase):
         self.assertIn("v-test · Test footer", html)
         self.assertIn('href="/static/styles.css"', html)
         self.assertNotIn("<style>", html)
+
+    def test_root_launcher_exposes_the_same_flask_app(self) -> None:
+        self.assertIs(launcher.app, panel.app)
 
     def test_login_uses_base_layout_without_authenticated_controls(self) -> None:
         html = self.page("/login")

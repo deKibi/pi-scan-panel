@@ -1,4 +1,4 @@
-# pdf_preview.py
+# pi_scan_panel/pdf_preview.py
 
 # Standard Libraries
 import argparse

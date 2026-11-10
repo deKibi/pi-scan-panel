@@ -1,0 +1,1213 @@
+# pi_scan_panel/web.py
+
+# Standard Libraries
+import hmac
+import os
+import re
+import secrets
+import subprocess
+import sys
+import threading
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any
+from zoneinfo import ZoneInfo
+
+# Third-party Libraries
+import pypdfium2 as pdfium
+from dotenv import load_dotenv
+from flask import (
+    Flask,
+    Response,
+    flash,
+    get_flashed_messages,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    send_from_directory,
+    session,
+    url_for,
+)
+from PIL import Image
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.utils import secure_filename
+
+
+# Scan settings
+SCAN_MODES: tuple[str, ...] = ("Color", "Gray", "Lineart")
+SCAN_RESOLUTIONS: tuple[str, ...] = ("300", "600")
+OUTPUT_FORMATS: tuple[str, ...] = ("png", "pdf")
+ROTATIONS: tuple[str, ...] = ("none", "90", "180", "270")
+DEFAULT_SCAN_DIR = "/home/pi/scans"
+DEFAULT_PRINTER_NAME = "Canon_LBP2900"
+DEFAULT_UPLOAD_DIR = "/home/pi/scans/uploads"
+SCAN_TIMEOUT_SECONDS = 900
+PRINT_TIMEOUT_SECONDS = 60
+SCAN_FILES_PER_PAGE = 20
+SCAN_PAGE_SIZES = (10, 20, 50)
+PREVIEW_MAX_SIZE = (640, 640)
+PREVIEW_JPEG_QUALITY = 85
+PDF_PREVIEW_TIMEOUT_SECONDS = 10
+# Bump this when preview dimensions or encoding settings change.
+PREVIEW_CACHE_VERSION = 2
+KYIV_TIMEZONE = ZoneInfo("Europe/Kyiv")
+SCAN_FILE_EXTENSIONS: frozenset[str] = frozenset({".png", ".pdf", ".jpg", ".jpeg"})
+IMAGE_FILE_EXTENSIONS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg"})
+PRINT_FILE_EXTENSIONS: frozenset[str] = frozenset({".png", ".pdf", ".jpg", ".jpeg"})
+UPLOAD_MIME_TYPES: dict[str, frozenset[str]] = {
+    ".pdf": frozenset({"application/pdf"}),
+    ".png": frozenset({"image/png"}),
+    ".jpg": frozenset({"image/jpeg", "image/pjpeg"}),
+    ".jpeg": frozenset({"image/jpeg", "image/pjpeg"}),
+}
+
+# Runtime state
+command_lock = threading.Lock()
+preview_lock = threading.Lock()
+last_scan: dict[str, str] | None = None
+
+
+load_dotenv()
+
+APP_USERNAME = os.getenv("SCANNER_USERNAME")
+APP_PASSWORD = os.getenv("SCANNER_PASSWORD")
+APP_VERSION = os.getenv("PI_SCAN_PANEL_VERSION", "").strip()
+APP_FOOTER_TEXT = os.getenv("PI_SCAN_PANEL_FOOTER_TEXT", "").strip()
+SCAN_DIR = Path(os.getenv("SCANNER_SCAN_DIR", DEFAULT_SCAN_DIR)).expanduser()
+SCANNER_DEVICE = os.getenv("SCANNER_DEVICE")
+PRINTER_NAME = os.getenv("PI_SCAN_PANEL_PRINTER_NAME", DEFAULT_PRINTER_NAME)
+UPLOAD_DIR = Path(os.getenv("PI_SCAN_PANEL_UPLOAD_DIR", DEFAULT_UPLOAD_DIR)).expanduser()
+MAX_UPLOAD_MB = int(os.getenv("PI_SCAN_PANEL_MAX_UPLOAD_MB", "25"))
+
+if not APP_USERNAME or not APP_PASSWORD:
+    raise RuntimeError("SCANNER_USERNAME and SCANNER_PASSWORD must be set in .env")
+
+app = Flask(__name__)
+app.secret_key = os.getenv("SCANNER_SECRET_KEY") or secrets.token_hex(32)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+
+def render_page(
+    title: str,
+    heading: str,
+    body_template: str,
+    message: str | None = None,
+    message_type: str = "success",
+    subtitle: str | None = None,
+    **context: Any,
+) -> str:
+    return render_template(
+        body_template,
+        title=title,
+        heading=heading,
+        subtitle=subtitle,
+        logged_in=session.get("logged_in"),
+        app_version=APP_VERSION,
+        footer_text=APP_FOOTER_TEXT,
+        message=message,
+        message_type=message_type,
+        **context,
+    )
+
+
+def login_required(view: Any) -> Any:
+    @wraps(view)
+    def wrapped_view(*args: Any, **kwargs: Any) -> Any:
+        if not session.get("logged_in"):
+            if (
+                request.method == "POST" and wants_action_json()
+                and request.endpoint in {
+                    "rotate_scan", "print_scan", "delete_scan", "restore_trash",
+                    "delete_trash", "empty_trash",
+                }
+            ):
+                return jsonify(success=False, message="Сесію завершено."), 401
+            return redirect(url_for("login"))
+
+        return view(*args, **kwargs)
+
+    return wrapped_view
+
+
+def get_form_values() -> dict[str, str]:
+    return {
+        "mode": request.form.get("mode", "Color"),
+        "resolution": request.form.get("resolution", "300"),
+        "output_format": request.form.get("output_format", "png"),
+        "rotation": request.form.get("rotation", "none"),
+    }
+
+
+def validate_form(values: dict[str, str]) -> str | None:
+    if values["mode"] not in SCAN_MODES:
+        return "Невідомий режим сканування."
+    if values["resolution"] not in SCAN_RESOLUTIONS:
+        return "Невідома роздільність."
+    if values["output_format"] not in OUTPUT_FORMATS:
+        return "Невідомий формат файлу."
+    if values["rotation"] not in ROTATIONS:
+        return "Невідоме значення повороту."
+
+    return None
+
+
+def build_scan_command(values: dict[str, str]) -> list[str]:
+    command = ["scanimage"]
+
+    if SCANNER_DEVICE:
+        command.extend(["-d", SCANNER_DEVICE])
+
+    command.extend(
+        [
+            "--format=png",
+            "--mode",
+            values["mode"],
+            "--resolution",
+            values["resolution"],
+            "-x",
+            "210",
+            "-y",
+            "297",
+        ]
+    )
+    return command
+
+
+def create_timestamped_filename(extension: str) -> str:
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    return f"scan-{timestamp}.{extension}"
+
+
+def format_file_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+
+    return f"{size_bytes / 1024 / 1024:.1f} MB"
+
+
+def get_safe_scan_path(filename: str) -> Path | None:
+    requested_name = Path(filename).name
+    requested_path = SCAN_DIR / requested_name
+
+    if requested_name != filename:
+        return None
+    if requested_path.suffix.lower() not in SCAN_FILE_EXTENSIONS:
+        return None
+    if not requested_path.is_file():
+        return None
+
+    return requested_path
+
+
+def get_preview_version(stat: os.stat_result) -> str:
+    return (
+        f"{PREVIEW_CACHE_VERSION}-{stat.st_mtime_ns}-"
+        f"{stat.st_ctime_ns}-{stat.st_size}"
+    )
+
+
+def get_trash_dir() -> Path:
+    directory = SCAN_DIR / ".trash"
+    if directory.is_symlink():
+        raise OSError("Папка кошика не може бути символічним посиланням.")
+    return directory
+
+
+def get_trash_file(entry_id: str) -> tuple[Path, datetime] | None:
+    if not re.fullmatch(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}", entry_id):
+        return None
+    try:
+        deleted_at = datetime.strptime(
+            entry_id.split("-")[0], "%Y%m%dT%H%M%S%fZ"
+        )
+    except ValueError:
+        return None
+    directory = get_trash_dir() / entry_id
+    if directory.is_symlink() or not directory.is_dir():
+        return None
+    contents = list(directory.iterdir())
+    if len(contents) != 1:
+        return None
+    path = contents[0]
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or path.suffix.lower() not in SCAN_FILE_EXTENSIONS
+    ):
+        return None
+    return path, deleted_at.replace(tzinfo=timezone.utc)
+
+
+def list_trash_files() -> list[dict[str, Any]]:
+    directory = get_trash_dir()
+    if not directory.exists():
+        return []
+    files: list[dict[str, Any]] = []
+    for entry in directory.iterdir():
+        try:
+            result = get_trash_file(entry.name)
+            if result is None:
+                continue
+            path, deleted_at = result
+            stat = path.stat()
+        except FileNotFoundError:
+            # Listing must tolerate a concurrent restore or permanent deletion.
+            continue
+        files.append(
+            {
+                "id": entry.name,
+                "name": path.name,
+                "size": format_file_size(stat.st_size),
+                "is_image": path.suffix.lower() in IMAGE_FILE_EXTENSIONS,
+                "preview_url": (
+                    url_for(
+                        "preview_trash", entry_id=entry.name,
+                        v=get_preview_version(stat),
+                    )
+                ),
+                "deleted_at": deleted_at.astimezone(KYIV_TIMEZONE).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
+        )
+    return sorted(files, key=lambda item: item["id"], reverse=True)
+
+
+def redirect_to_trash() -> Response:
+    if wants_action_json():
+        return list_action_response("trash", get_trash_list_context())
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    return redirect(
+        url_for(
+            "trash",
+            page=max(1, request.args.get("page", 1, type=int)),
+            per_page=per_page,
+        )
+    )
+
+
+def wants_action_json() -> bool:
+    return request.accept_mimetypes.best == "application/json"
+
+
+def get_scan_list_context() -> dict[str, Any]:
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    files, page, page_count = list_scan_files(
+        request.args.get("page", 1, type=int), per_page
+    )
+    return dict(
+        scan_files=files, page=page, page_count=page_count,
+        per_page=per_page, page_sizes=SCAN_PAGE_SIZES,
+    )
+
+
+def get_trash_list_context() -> dict[str, Any]:
+    message = None
+    try:
+        files = list_trash_files()
+    except OSError as error:
+        files = []
+        message = f"Не вдалося прочитати кошик: {error}"
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    page_count = max(1, (len(files) + per_page - 1) // per_page)
+    page = min(max(1, request.args.get("page", 1, type=int)), page_count)
+    offset = (page - 1) * per_page
+    return dict(
+        files=files[offset:offset + per_page],
+        entry_ids=[file["id"] for file in files], total=len(files),
+        unavailable=message is not None, message=message,
+        page=page, page_count=page_count, per_page=per_page,
+        page_sizes=SCAN_PAGE_SIZES,
+    )
+
+
+def list_action_response(
+    endpoint: str, context: dict[str, Any], *,
+    revert: dict[str, Any] | None = None,
+) -> Response:
+    messages = get_flashed_messages(with_categories=True)
+    message_type, message = messages[-1]
+    if context.get("unavailable"):
+        return jsonify(
+            success=False, message=f"{message} {context['message']}",
+            message_type="error",
+        )
+    payload = dict(
+        success=message_type == "success", message=message,
+        message_type=message_type,
+        list_html=render_template(
+            "_trash_list.html" if endpoint == "trash" else "_scan_list.html",
+            **context,
+        ),
+        page=context["page"], per_page=context["per_page"],
+        url=url_for(
+            endpoint, page=context["page"], per_page=context["per_page"]
+        ),
+    )
+    if endpoint == "index":
+        payload["last_scan_html"] = render_template(
+            "_last_scan.html",
+            filename=last_scan["filename"] if last_scan else None,
+        )
+    if revert is not None and payload["success"]:
+        payload["revert"] = revert
+    return jsonify(payload)
+
+
+def redirect_to_scan_list(
+    destination: str, *, revert: dict[str, Any] | None = None,
+) -> Response:
+    if wants_action_json():
+        return list_action_response(
+            "index", get_scan_list_context(), revert=revert
+        )
+    return redirect(destination)
+
+
+def scan_action_response(
+    message: str, message_type: str = "success", filename: str | None = None,
+    *, rotated_path: Path | None = None,
+    rotated_stat: os.stat_result | None = None,
+    revert: dict[str, Any] | None = None,
+) -> str | Response:
+    if not wants_action_json():
+        return render_home(
+            message=message, message_type=message_type, filename=filename
+        )
+    payload = dict(
+        success=message_type == "success", message=message,
+        message_type=message_type,
+    )
+    if rotated_path is not None:
+        stat = (
+            rotated_stat if rotated_stat is not None else rotated_path.stat()
+        )
+        completed_at = datetime.fromtimestamp(stat.st_mtime, tz=KYIV_TIMEZONE)
+        payload["file"] = dict(
+            id=rotated_path.name,
+            preview_url=url_for(
+                "preview_scan", filename=rotated_path.name,
+                v=get_preview_version(stat),
+            ),
+            metadata=(
+                f"{completed_at:%Y-%m-%d %H:%M:%S}"
+                f" · {format_file_size(stat.st_size)}"
+            ),
+        )
+    if revert is not None and payload["success"]:
+        payload["revert"] = revert
+    return jsonify(payload)
+
+
+def list_scan_files(
+    page: int = 1, per_page: int = SCAN_FILES_PER_PAGE
+) -> tuple[list[dict[str, Any]], int, int]:
+    if not SCAN_DIR.is_dir():
+        return [], 1, 1
+
+    scan_paths: list[tuple[Path, os.stat_result]] = []
+    with os.scandir(SCAN_DIR) as entries:
+        for entry in entries:
+            if Path(entry.name).suffix.lower() in SCAN_FILE_EXTENSIONS and entry.is_file():
+                scan_paths.append((Path(entry.path), entry.stat()))
+
+    scan_paths.sort(key=lambda item: item[1].st_mtime_ns, reverse=True)
+    page_count = max(1, (len(scan_paths) + per_page - 1) // per_page)
+    page = min(max(1, page), page_count)
+    offset = (page - 1) * per_page
+    files: list[dict[str, Any]] = []
+    for path, stat in scan_paths[offset:offset + per_page]:
+        suffix = path.suffix.lower()
+        completed_at = datetime.fromtimestamp(stat.st_mtime, tz=KYIV_TIMEZONE)
+        files.append(
+            {
+                "name": path.name,
+                "completed_at": completed_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "mtime": stat.st_mtime,
+                "size": format_file_size(stat.st_size),
+                "is_image": suffix in IMAGE_FILE_EXTENSIONS,
+                "can_rotate": suffix in SCAN_FILE_EXTENSIONS,
+                "open_url": url_for("open_scan", filename=path.name),
+                "preview_url": (
+                    url_for(
+                        "preview_scan",
+                        filename=path.name,
+                        v=get_preview_version(stat),
+                    )
+                ),
+                "download_url": url_for("download_scan", filename=path.name),
+                "rotate_url": url_for(
+                    "rotate_scan", filename=path.name, page=page, per_page=per_page
+                ),
+                "print_url": url_for(
+                    "print_scan", filename=path.name, page=page, per_page=per_page
+                ),
+                "delete_url": url_for(
+                    "delete_scan", filename=path.name, page=page, per_page=per_page
+                ),
+            }
+        )
+
+    return files, page, page_count
+
+
+def get_preview_dir(path: Path, trash_id: str | None = None) -> Path:
+    directory = SCAN_DIR / "previews"
+    directories = [directory]
+    if trash_id is not None:
+        if not re.fullmatch(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}", trash_id):
+            raise ValueError("Invalid trash ID")
+        directories.extend([directory / "trash", directory / "trash" / trash_id])
+    else:
+        directories.append(directory / path.name)
+    if any(item.is_symlink() for item in directories):
+        raise OSError("Папка прев'ю не може бути символічним посиланням.")
+    return directories[-1]
+
+
+def remove_scan_previews(path: Path, *, trash_id: str | None = None) -> None:
+    preview_dir = get_preview_dir(path, trash_id)
+    if not preview_dir.is_dir():
+        return
+
+    for preview_path in preview_dir.glob("*.jpg"):
+        preview_path.unlink(missing_ok=True)
+    preview_dir.rmdir()
+
+
+def remove_trash_previews(path: Path, entry_id: str) -> None:
+    try:
+        remove_scan_previews(path, trash_id=entry_id)
+    except OSError:
+        app.logger.exception("Trash action completed, but preview cleanup failed")
+
+
+def get_scan_preview(path: Path, *, trash_id: str | None = None) -> Path:
+    # Serializing generation bounds memory use when decoding large scans on the Pi.
+    with preview_lock:
+        stat = path.stat()
+        preview_dir = get_preview_dir(path, trash_id)
+        preview_path = preview_dir / f"{get_preview_version(stat)}.jpg"
+        if preview_path.is_file():
+            return preview_path
+
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(
+            dir=preview_dir, suffix=".jpg", delete=False
+        ) as preview_file:
+            temporary_path = Path(preview_file.name)
+            try:
+                if path.suffix.lower() == ".pdf":
+                    preview_file.close()
+                    # A process lets the timeout stop native PDF rendering.
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(Path(__file__).with_name("pdf_preview.py")),
+                            str(path.resolve()),
+                            str(temporary_path.resolve()),
+                            str(PREVIEW_MAX_SIZE[0]),
+                            str(PREVIEW_MAX_SIZE[1]),
+                            str(PREVIEW_JPEG_QUALITY),
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        check=True,
+                        timeout=PDF_PREVIEW_TIMEOUT_SECONDS,
+                    )
+                else:
+                    with Image.open(path) as image:
+                        image.thumbnail(
+                            PREVIEW_MAX_SIZE, Image.Resampling.LANCZOS
+                        )
+                        if (
+                            image.mode in {"RGBA", "LA"}
+                            or "transparency" in image.info
+                        ):
+                            image = image.convert("RGBA")
+                            thumbnail = Image.new("RGB", image.size, "white")
+                            thumbnail.paste(image, mask=image.getchannel("A"))
+                        else:
+                            thumbnail = image.convert("RGB")
+                        with thumbnail:
+                            thumbnail.save(
+                                preview_file,
+                                format="JPEG",
+                                quality=PREVIEW_JPEG_QUALITY,
+                                optimize=True,
+                            )
+                preview_file.close()
+                temporary_path.replace(preview_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
+        for old_preview in preview_dir.glob("*.jpg"):
+            if old_preview != preview_path:
+                old_preview.unlink(missing_ok=True)
+        return preview_path
+
+
+def get_printer_status() -> str:
+    status_parts: list[str] = []
+    commands = (
+        ["lpstat", "-p", PRINTER_NAME, "-l"],
+        ["lpstat", "-o", PRINTER_NAME],
+    )
+
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return f"Статус принтера недоступний: {error}"
+
+        output = result.stdout.strip() or result.stderr.strip()
+        if output:
+            status_parts.append(output)
+
+    return "\n".join(status_parts) if status_parts else f"Принтер {PRINTER_NAME}: черга порожня."
+
+
+def run_print_command(file_path: Path) -> str:
+    result = subprocess.run(
+        ["lp", "-d", PRINTER_NAME, "-o", "media=A4", "-n", "1", str(file_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+        timeout=PRINT_TIMEOUT_SECONDS,
+    )
+    return result.stdout.strip()
+
+
+def print_file_with_lock(file_path: Path) -> tuple[str, str]:
+    if not command_lock.acquire(blocking=False):
+        return "Сканер або принтер вже виконує іншу команду. Спробуйте ще раз за кілька секунд.", "busy"
+
+    try:
+        output = run_print_command(file_path)
+    except subprocess.TimeoutExpired:
+        return "Передача файлу на друк перевищила ліміт часу.", "error"
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() or error.stdout.strip()
+        suffix = f" Деталі: {detail}" if detail else ""
+        return f"Не вдалося відправити файл на друк.{suffix}", "error"
+    except OSError as error:
+        return f"Не вдалося запустити команду друку: {error}", "error"
+    finally:
+        command_lock.release()
+
+    detail = f" CUPS: {output}" if output else ""
+    return f"Файл відправлено на друк.{detail}", "success"
+
+
+def create_safe_upload_filename(original_filename: str) -> str | None:
+    safe_name = secure_filename(original_filename)
+    if not safe_name:
+        return None
+
+    path = Path(safe_name)
+    suffix = path.suffix.lower()
+    if suffix not in PRINT_FILE_EXTENSIONS:
+        return None
+
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", path.stem).strip("-") or "upload"
+    stem = stem[:80]
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    return f"upload-{timestamp}-{stem}{suffix}"
+
+
+def is_allowed_upload(filename: str, mime_type: str) -> bool:
+    suffix = Path(filename).suffix.lower()
+    allowed_mime_types = UPLOAD_MIME_TYPES.get(suffix)
+
+    return bool(allowed_mime_types and mime_type in allowed_mime_types)
+
+
+def save_uploaded_print_file() -> tuple[Path | None, str | None]:
+    uploaded_file = request.files.get("upload")
+    if uploaded_file is None or not uploaded_file.filename:
+        return None, "Оберіть файл для друку."
+
+    upload_filename = create_safe_upload_filename(uploaded_file.filename)
+    if upload_filename is None:
+        return None, "Підтримуються тільки PDF, PNG, JPG або JPEG."
+    if not is_allowed_upload(upload_filename, uploaded_file.mimetype):
+        return None, "Тип файлу не відповідає дозволеним форматам PDF, PNG або JPG."
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    upload_path = UPLOAD_DIR / upload_filename
+    uploaded_file.save(upload_path)
+    return upload_path, None
+
+
+def rotate_image_file(
+    path: Path, degrees: int = 90, *, expected_version: str | None = None,
+) -> os.stat_result:
+    with preview_lock:
+        if expected_version is not None and (
+            path.is_symlink()
+            or get_preview_version(path.stat()) != expected_version
+        ):
+            raise ValueError(
+                "Файл змінився. Скасувати попереднє обертання неможливо."
+            )
+        remove_scan_previews(path)
+        with Image.open(path) as image:
+            rotated_image = image.rotate(-degrees, expand=True)
+            if path.suffix.lower() in {".jpg", ".jpeg"} and rotated_image.mode in {"RGBA", "P"}:
+                rotated_image = rotated_image.convert("RGB")
+
+            rotated_image.save(path)
+        return path.stat()
+
+
+def rotate_pdf_file(
+    path: Path, degrees: int = 90, *, expected_version: str | None = None,
+) -> os.stat_result:
+    with preview_lock:
+        if expected_version is not None and (
+            path.is_symlink()
+            or get_preview_version(path.stat()) != expected_version
+        ):
+            raise ValueError(
+                "Файл змінився. Скасувати попереднє обертання неможливо."
+            )
+        with NamedTemporaryFile(
+            dir=path.parent, suffix=".tmp", delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        try:
+            with pdfium.PdfDocument(path) as document:
+                if not len(document):
+                    raise ValueError("PDF не містить сторінок.")
+                for index in range(len(document)):
+                    page = document[index]
+                    try:
+                        page.set_rotation((page.get_rotation() + degrees) % 360)
+                    finally:
+                        page.close()
+                document.save(temporary_path)
+
+            # Replace only after saving and closing the complete document.
+            remove_scan_previews(path)
+            temporary_path.replace(path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        return path.stat()
+
+
+def apply_scan_rotation(path: Path, rotation: str) -> None:
+    if rotation == "none":
+        return
+
+    rotate_image_file(path, int(rotation))
+
+
+def run_scan(values: dict[str, str]) -> str:
+    global last_scan
+
+    SCAN_DIR.mkdir(parents=True, exist_ok=True)
+    png_filename = create_timestamped_filename("png")
+    png_path = SCAN_DIR / png_filename
+
+    try:
+        with png_path.open("wb") as png_file:
+            subprocess.run(
+                build_scan_command(values),
+                stdout=png_file,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=SCAN_TIMEOUT_SECONDS,
+            )
+        apply_scan_rotation(png_path, values["rotation"])
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        png_path.unlink(missing_ok=True)
+        raise
+
+    if values["output_format"] == "png":
+        last_scan = {"filename": png_filename, "format": "png"}
+        return png_filename
+
+    pdf_filename = png_path.with_suffix(".pdf").name
+    pdf_path = SCAN_DIR / pdf_filename
+    try:
+        subprocess.run(
+            ["img2pdf", str(png_path), "-o", str(pdf_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            timeout=SCAN_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pdf_path.unlink(missing_ok=True)
+        raise
+
+    png_path.unlink(missing_ok=True)
+    last_scan = {"filename": pdf_filename, "format": "pdf"}
+    return pdf_filename
+
+
+def render_home(
+    values: dict[str, str] | None = None,
+    message: str | None = None,
+    message_type: str = "success",
+    filename: str | None = None,
+) -> str:
+    context = get_scan_list_context()
+    return render_page(
+        title="Pi Scan Panel",
+        heading="Pi Scan Panel",
+        subtitle="Локальна веб-панель для USB-сканера",
+        body_template="index.html",
+        message=message,
+        message_type=message_type,
+        modes=SCAN_MODES,
+        resolutions=SCAN_RESOLUTIONS,
+        formats=OUTPUT_FORMATS,
+        rotations=ROTATIONS,
+        values=values
+        or {
+            "mode": "Color",
+            "resolution": "300",
+            "output_format": "png",
+            "rotation": "none",
+        },
+        busy=command_lock.locked(),
+        filename=filename,
+        **context,
+    )
+
+
+@app.route("/", methods=["GET", "POST"])
+@login_required
+def index() -> str:
+    if request.method == "GET":
+        filename = last_scan["filename"] if last_scan else None
+        return render_home(filename=filename)
+
+    values = get_form_values()
+    validation_error = validate_form(values)
+    if validation_error:
+        return render_home(values, validation_error, "error")
+
+    if not command_lock.acquire(blocking=False):
+        return render_home(values, "Сканер або принтер вже виконує іншу команду.", "busy")
+
+    filename = None
+    message = "Сканування завершено."
+    message_type = "success"
+
+    try:
+        filename = run_scan(values)
+    except subprocess.TimeoutExpired:
+        message = "Сканування перевищило ліміт часу."
+        message_type = "error"
+    except subprocess.CalledProcessError as error:
+        stderr = error.stderr.decode("utf-8", errors="replace").strip()
+        detail = f" Деталі: {stderr}" if stderr else ""
+        message = f"Команда сканування завершилась з помилкою.{detail}"
+        message_type = "error"
+    except OSError as error:
+        message = f"Не вдалося запустити команду: {error}"
+        message_type = "error"
+    finally:
+        command_lock.release()
+
+    return render_home(values, message, message_type, filename)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login() -> str | Response:
+    if request.method == "GET":
+        return render_page(
+            title="Вхід",
+            heading="Вхід",
+            subtitle="Доступ тільки для локальних користувачів",
+            body_template="login.html",
+        )
+
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    if hmac.compare_digest(username, APP_USERNAME) and hmac.compare_digest(password, APP_PASSWORD):
+        session.clear()
+        session["logged_in"] = True
+        return redirect(url_for("index"))
+
+    return render_page(
+        title="Вхід",
+        heading="Вхід",
+        subtitle="Доступ тільки для локальних користувачів",
+        body_template="login.html",
+        message="Невірний логін або пароль.",
+        message_type="error",
+    )
+
+
+@app.route("/logout")
+def logout() -> Response:
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/download/<path:filename>")
+@login_required
+def download_scan(filename: str) -> Response:
+    requested_path = get_safe_scan_path(filename)
+
+    if requested_path is None:
+        return Response("Invalid filename", status=400)
+
+    return send_from_directory(SCAN_DIR, requested_path.name, as_attachment=True)
+
+
+@app.route("/files/<path:filename>")
+@login_required
+def open_scan(filename: str) -> Response:
+    requested_path = get_safe_scan_path(filename)
+
+    if requested_path is None:
+        return Response("Invalid filename", status=400)
+
+    return send_from_directory(SCAN_DIR, requested_path.name, as_attachment=False)
+
+
+@app.route("/previews/<path:filename>")
+@login_required
+def preview_scan(filename: str) -> Response:
+    requested_path = get_safe_scan_path(filename)
+    if requested_path is None:
+        return Response("Invalid filename", status=400)
+
+    try:
+        preview_path = get_scan_preview(requested_path)
+    except (
+        OSError, ValueError, Image.DecompressionBombError,
+        subprocess.CalledProcessError, subprocess.TimeoutExpired,
+    ):
+        app.logger.exception("Could not generate scan preview")
+        return Response("Preview unavailable", status=500)
+
+    response = send_from_directory(preview_path.parent, preview_path.name, max_age=0)
+    response.cache_control.private = True
+    return response
+
+
+@app.route("/printer-status")
+@login_required
+def printer_status() -> Response:
+    response = jsonify({"status": get_printer_status()})
+    response.cache_control.no_store = True
+    return response
+
+
+@app.route("/rotate/<path:filename>", methods=["POST"])
+@login_required
+def rotate_scan(filename: str) -> str | Response:
+    requested_path = get_safe_scan_path(filename)
+
+    if requested_path is None:
+        return scan_action_response(
+            message="Файл не знайдено або ім'я файлу некоректне.",
+            message_type="error",
+        )
+    direction = request.form.get("direction", "clockwise")
+    reverting = direction == "counterclockwise"
+    expected_version = (
+        request.form.get("expected_version") if reverting else None
+    )
+    if direction not in {"clockwise", "counterclockwise"} or (
+        reverting and not expected_version
+    ):
+        return scan_action_response(
+            message="Некоректний запит обертання.", message_type="error"
+        )
+    try:
+        degrees = -90 if reverting else 90
+        if requested_path.suffix.lower() == ".pdf":
+            stat = rotate_pdf_file(
+                requested_path, degrees, expected_version=expected_version
+            )
+        else:
+            stat = rotate_image_file(
+                requested_path, degrees, expected_version=expected_version
+            )
+    except (OSError, ValueError, pdfium.PdfiumError) as error:
+        return scan_action_response(
+            message=f"Не вдалося повернути файл: {error}", message_type="error"
+        )
+
+    revert = None if reverting else dict(
+        url=url_for("rotate_scan", filename=requested_path.name),
+        fields=dict(
+            direction="counterclockwise",
+            expected_version=get_preview_version(stat),
+        ),
+        file_id=requested_path.name,
+    )
+    return scan_action_response(
+        message="Дію скасовано." if reverting else "Файл повернуто на 90°.",
+        filename=requested_path.name, rotated_path=requested_path,
+        rotated_stat=stat, revert=revert,
+    )
+
+
+@app.route("/delete/<path:filename>", methods=["POST"])
+@login_required
+def delete_scan(filename: str) -> Response:
+    global last_scan
+
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    destination = url_for(
+        "index",
+        page=max(1, request.args.get("page", 1, type=int)),
+        per_page=per_page,
+    )
+    try:
+        with preview_lock:
+            requested_path = get_safe_scan_path(filename)
+            if requested_path is None or requested_path.is_symlink():
+                flash(
+                    "Файл не знайдено або ім'я файлу некоректне.", "error"
+                )
+                return redirect_to_scan_list(destination)
+            timestamp = datetime.now(timezone.utc).strftime(
+                "%Y%m%dT%H%M%S%fZ"
+            )
+            directory = get_trash_dir() / f"{timestamp}-{secrets.token_hex(8)}"
+            directory.parent.mkdir(parents=True, exist_ok=True)
+            directory.mkdir()
+            try:
+                requested_path.rename(directory / requested_path.name)
+            except OSError:
+                directory.rmdir()
+                raise
+            if last_scan and last_scan.get("filename") == requested_path.name:
+                last_scan = None
+            try:
+                remove_scan_previews(requested_path)
+            except OSError:
+                app.logger.exception(
+                    "Scan moved to trash, but preview cleanup failed"
+                )
+    except OSError as error:
+        flash(f"Не вдалося перемістити файл у кошик: {error}", "error")
+        return redirect_to_scan_list(destination)
+
+    flash("Файл переміщено в кошик. Його можна відновити.", "success")
+    return redirect_to_scan_list(
+        destination,
+        revert=dict(
+            url=url_for(
+                "restore_trash", entry_id=directory.name, return_to="scans",
+                page=max(1, request.args.get("page", 1, type=int)),
+                per_page=per_page,
+            ),
+            fields={}, file_id=requested_path.name,
+        ),
+    )
+
+
+@app.route("/trash")
+@login_required
+def trash() -> str:
+    context = get_trash_list_context()
+    return render_page(
+        title="Кошик — Pi Scan Panel",
+        heading="Кошик",
+        body_template="trash.html",
+        message_type="error",
+        **context,
+    )
+
+
+@app.route("/trash/<entry_id>/preview")
+@login_required
+def preview_trash(entry_id: str) -> Response:
+    try:
+        result = get_trash_file(entry_id)
+        if result is None:
+            return Response("Preview not found", status=404)
+        preview_path = get_scan_preview(result[0], trash_id=entry_id)
+    except FileNotFoundError:
+        return Response("Preview not found", status=404)
+    except (
+        OSError, ValueError, Image.DecompressionBombError,
+        subprocess.CalledProcessError, subprocess.TimeoutExpired,
+    ):
+        app.logger.exception("Could not generate trash preview")
+        return Response("Preview unavailable", status=500)
+
+    response = send_from_directory(preview_path.parent, preview_path.name, max_age=0)
+    response.cache_control.private = True
+    return response
+
+
+@app.route("/trash/<entry_id>/restore", methods=["POST"])
+@login_required
+def restore_trash(entry_id: str) -> Response:
+    try:
+        with preview_lock:
+            result = get_trash_file(entry_id)
+            if result is None:
+                flash("Файл у кошику не знайдено.", "error")
+            else:
+                path, _ = result
+                destination = SCAN_DIR / path.name
+                # Preserve metadata without overwriting an existing name.
+                os.link(path, destination)
+                path.unlink()
+                remove_trash_previews(path, entry_id)
+                path.parent.rmdir()
+                flash(
+                    "Дію скасовано."
+                    if request.args.get("return_to") == "scans"
+                    else "Файл відновлено до списку сканів.",
+                    "success",
+                )
+    except FileExistsError:
+        flash(
+            "Файл із таким ім'ям уже існує. "
+            "Відновлення скасовано без перезаписування.",
+            "error",
+        )
+    except OSError as error:
+        flash(
+            f"Не вдалося завершити відновлення файлу: {error}", "error"
+        )
+    if request.args.get("return_to") == "scans":
+        context = get_scan_list_context()
+        if wants_action_json():
+            return list_action_response("index", context)
+        return redirect(url_for(
+            "index", page=context["page"], per_page=context["per_page"]
+        ))
+    return redirect_to_trash()
+
+
+@app.route("/trash/<entry_id>/delete", methods=["POST"])
+@login_required
+def delete_trash(entry_id: str) -> Response:
+    try:
+        with preview_lock:
+            result = get_trash_file(entry_id)
+            if result is None:
+                flash("Файл у кошику не знайдено.", "error")
+                return redirect_to_trash()
+            path, _ = result
+            path.unlink()
+            remove_trash_previews(path, entry_id)
+            path.parent.rmdir()
+    except OSError as error:
+        flash(f"Не вдалося завершити видалення файлу: {error}", "error")
+    else:
+        flash("Файл видалено назавжди.", "success")
+    return redirect_to_trash()
+
+
+@app.route("/trash/empty", methods=["POST"])
+@login_required
+def empty_trash() -> Response:
+    deleted = 0
+    failed = 0
+    with preview_lock:
+        # Only remove entries included in the page the user confirmed.
+        for entry_id in set(request.form.getlist("entry_id")):
+            try:
+                result = get_trash_file(entry_id)
+                if result is None:
+                    continue
+                path, _ = result
+                path.unlink()
+                deleted += 1
+                remove_trash_previews(path, entry_id)
+                path.parent.rmdir()
+            except OSError:
+                failed += 1
+                app.logger.exception("Could not finish deleting a trash entry")
+    if failed:
+        flash(
+            f"Очищення завершено не повністю. Видалено файлів: {deleted}; "
+            f"помилок: {failed}.",
+            "error",
+        )
+    else:
+        flash(f"Видалено назавжди файлів: {deleted}.", "success")
+    return redirect_to_trash()
+
+
+@app.route("/print/<path:filename>", methods=["POST"])
+@login_required
+def print_scan(filename: str) -> str | Response:
+    requested_path = get_safe_scan_path(filename)
+
+    if requested_path is None:
+        return scan_action_response(
+            message="Файл не знайдено або ім'я файлу некоректне.",
+            message_type="error",
+        )
+    if requested_path.suffix.lower() not in PRINT_FILE_EXTENSIONS:
+        return scan_action_response(
+            message="Цей формат не підтримується для друку.", message_type="error"
+        )
+
+    message, message_type = print_file_with_lock(requested_path)
+    return scan_action_response(
+        message=message, message_type=message_type, filename=requested_path.name
+    )
+
+
+@app.route("/print-upload", methods=["POST"])
+@login_required
+def print_upload() -> str:
+    upload_path, error = save_uploaded_print_file()
+    if error or upload_path is None:
+        return render_home(message=error or "Не вдалося завантажити файл.", message_type="error")
+
+    message, message_type = print_file_with_lock(upload_path)
+    return render_home(message=message, message_type=message_type)
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_large_upload(error: RequestEntityTooLarge) -> tuple[str, int]:
+    return (
+        render_home(
+            message=f"Файл завеликий. Максимальний розмір: {MAX_UPLOAD_MB} MB.",
+            message_type="error",
+        ),
+        413,
+    )
+
+
+@app.route("/health")
+def health() -> Response:
+    return jsonify(
+        {
+            "status": "ok",
+            "busy": command_lock.locked(),
+            "command_busy": command_lock.locked(),
+            "scan_dir": str(SCAN_DIR),
+            "upload_dir": str(UPLOAD_DIR),
+            "printer_name": PRINTER_NAME,
+            "auth_configured": bool(APP_USERNAME and APP_PASSWORD),
+        }
+    )
