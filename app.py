@@ -704,7 +704,7 @@ BASE_TEMPLATE = """
   <footer class="site-footer">
     <p>Developed by <a href="https://denys.kibitkin.com/" target="_blank" rel="noopener noreferrer">Denys Kibitkin</a></p>
     {% if app_version or footer_text %}
-      <p>{% if app_version %}v{{ app_version }}{% endif %}{% if app_version and footer_text %} · {% endif %}{{ footer_text }}</p>
+      <p>{% if app_version %}{{ app_version }}{% endif %}{% if app_version and footer_text %} · {% endif %}{{ footer_text }}</p>
     {% endif %}
   </footer>
   {% if logged_in %}
