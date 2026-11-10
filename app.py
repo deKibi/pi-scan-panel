@@ -70,6 +70,7 @@ load_dotenv()
 
 APP_USERNAME = os.getenv("SCANNER_USERNAME")
 APP_PASSWORD = os.getenv("SCANNER_PASSWORD")
+APP_VERSION = os.getenv("PI_SCAN_PANEL_VERSION", "").strip()
 SCAN_DIR = Path(os.getenv("SCANNER_SCAN_DIR", DEFAULT_SCAN_DIR)).expanduser()
 SCANNER_DEVICE = os.getenv("SCANNER_DEVICE")
 PRINTER_NAME = os.getenv("PI_SCAN_PANEL_PRINTER_NAME", DEFAULT_PRINTER_NAME)
@@ -135,6 +136,40 @@ BASE_TEMPLATE = """
       justify-content: space-between;
       gap: 16px;
       margin-bottom: 18px;
+    }
+
+    .site-footer {
+      width: min(100%, 720px);
+      margin: 0 auto;
+      padding: 0 16px 36px;
+      color: var(--muted);
+      font-size: 0.85rem;
+      text-align: center;
+      overflow-wrap: anywhere;
+    }
+
+    .site-footer p {
+      margin: 0;
+    }
+
+    .site-footer p + p {
+      margin-top: 4px;
+    }
+
+    .site-footer a {
+      color: var(--accent);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+    .site-footer a:hover {
+      color: var(--accent-strong);
+    }
+
+    .site-footer a:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+      border-radius: 2px;
     }
 
     h1 {
@@ -665,6 +700,10 @@ BASE_TEMPLATE = """
       {{ body|safe }}
     </section>
   </main>
+  <footer class="site-footer">
+    <p>Developed by <a href="https://denys.kibitkin.com/" target="_blank" rel="noopener noreferrer">Denys Kibitkin</a></p>
+    <p>{% if app_version %}v{{ app_version }} · {% endif %}Developed in Canada</p>
+  </footer>
   {% if logged_in %}
     <script src="{{ url_for('static', filename='scan-previews.js') }}" defer></script>
     <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
@@ -1080,6 +1119,7 @@ def render_page(
         heading=heading,
         subtitle=subtitle,
         logged_in=session.get("logged_in"),
+        app_version=APP_VERSION,
         message=message,
         message_type=message_type,
         body=body,
