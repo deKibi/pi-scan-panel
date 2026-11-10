@@ -189,16 +189,16 @@ Run the focused backend tests after installing `requirements.txt`:
 python -m unittest discover -s tests -p 'test_previews.py' -v
 ```
 
-These tests use synthetic credentials, bypass `.env` loading, and isolate scan files in temporary directories. They do not scan or print. If Node.js is available, verify the shared browser loading queue without additional packages:
+These tests generate their own temporary PDFs, use synthetic credentials, bypass `.env` loading, and isolate scan files in temporary directories. They do not scan or print. If Node.js is available, verify the shared browser loading queue without additional packages:
 
 ```bash
 node --test tests/test_scan_previews.js
 ```
 
-Small portrait, landscape, and two-page PDFs are included in `tests/fixtures/pdf/`. To create an isolated local scan directory with these examples and an additional scan-like PDF of approximately 16 MB:
+Demo PDFs are local files and are not tracked in Git. To generate portrait, landscape, and two-page examples in the ignored `demo-scans/` directory, with an additional scan-like PDF of approximately 16 MB, run the following command. The generator replaces examples with the same names, so run it only when you want to recreate them:
 
 ```bash
-preview_scan_dir="$(mktemp -d -t pi-scan-preview)"
+preview_scan_dir="$PWD/demo-scans"
 python tests/generate_preview_pdfs.py --output "$preview_scan_dir" --large
 ```
 

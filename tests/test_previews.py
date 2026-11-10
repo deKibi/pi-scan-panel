@@ -17,6 +17,9 @@ from unittest.mock import patch
 # Third-party Libraries
 from PIL import Image
 
+# Custom Modules
+from generate_preview_pdfs import generate_samples
+
 
 # Import the app without reading .env or using real credentials.
 with (
@@ -31,10 +34,14 @@ with (
     panel = importlib.import_module("app")
 
 
-FIXTURES = Path(__file__).parent / "fixtures" / "pdf"
-
-
 class PreviewTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        directory = TemporaryDirectory(prefix="pi-scan-preview-fixtures-")
+        cls.addClassCleanup(directory.cleanup)
+        cls.fixtures = Path(directory.name)
+        generate_samples(cls.fixtures)
+
     def setUp(self) -> None:
         self.directory = TemporaryDirectory(prefix="pi-scan-preview-test-")
         self.addCleanup(self.directory.cleanup)
@@ -58,7 +65,7 @@ class PreviewTests(unittest.TestCase):
         return response
 
     def copy_pdf(self, name: str = "portrait") -> Path:
-        source = FIXTURES / f"preview-{name}.pdf"
+        source = self.fixtures / f"preview-{name}.pdf"
         destination = self.scan_dir / source.name
         shutil.copyfile(source, destination)
         return destination
@@ -105,7 +112,7 @@ class PreviewTests(unittest.TestCase):
     def test_replaced_pdf_invalidates_cache(self) -> None:
         path = self.copy_pdf()
         previous = panel.get_scan_preview(path)
-        shutil.copyfile(FIXTURES / "preview-landscape.pdf", path)
+        shutil.copyfile(self.fixtures / "preview-landscape.pdf", path)
         current = panel.get_scan_preview(path)
         self.assertNotEqual(previous, current)
         self.assertFalse(previous.exists())

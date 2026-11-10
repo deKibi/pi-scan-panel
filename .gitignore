@@ -85,3 +85,4 @@ sessions/
 
 # Project Files
 demo-scans
+/tests/fixtures/pdf/*.pdf
