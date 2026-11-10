@@ -332,7 +332,10 @@ def get_trash_list_context() -> dict[str, Any]:
     )
 
 
-def list_action_response(endpoint: str, context: dict[str, Any]) -> Response:
+def list_action_response(
+    endpoint: str, context: dict[str, Any], *,
+    revert: dict[str, Any] | None = None,
+) -> Response:
     messages = get_flashed_messages(with_categories=True)
     message_type, message = messages[-1]
     if context.get("unavailable"):
@@ -357,18 +360,26 @@ def list_action_response(endpoint: str, context: dict[str, Any]) -> Response:
             "_last_scan.html",
             filename=last_scan["filename"] if last_scan else None,
         )
+    if revert is not None and payload["success"]:
+        payload["revert"] = revert
     return jsonify(payload)
 
 
-def redirect_to_scan_list(destination: str) -> Response:
+def redirect_to_scan_list(
+    destination: str, *, revert: dict[str, Any] | None = None,
+) -> Response:
     if wants_action_json():
-        return list_action_response("index", get_scan_list_context())
+        return list_action_response(
+            "index", get_scan_list_context(), revert=revert
+        )
     return redirect(destination)
 
 
 def scan_action_response(
     message: str, message_type: str = "success", filename: str | None = None,
     *, rotated_path: Path | None = None,
+    rotated_stat: os.stat_result | None = None,
+    revert: dict[str, Any] | None = None,
 ) -> str | Response:
     if not wants_action_json():
         return render_home(
@@ -379,7 +390,9 @@ def scan_action_response(
         message_type=message_type,
     )
     if rotated_path is not None:
-        stat = rotated_path.stat()
+        stat = (
+            rotated_stat if rotated_stat is not None else rotated_path.stat()
+        )
         completed_at = datetime.fromtimestamp(stat.st_mtime, tz=KYIV_TIMEZONE)
         payload["file"] = dict(
             id=rotated_path.name,
@@ -392,6 +405,8 @@ def scan_action_response(
                 f" · {format_file_size(stat.st_size)}"
             ),
         )
+    if revert is not None and payload["success"]:
+        payload["revert"] = revert
     return jsonify(payload)
 
 
@@ -643,8 +658,17 @@ def save_uploaded_print_file() -> tuple[Path | None, str | None]:
     return upload_path, None
 
 
-def rotate_image_file(path: Path, degrees: int = 90) -> None:
+def rotate_image_file(
+    path: Path, degrees: int = 90, *, expected_version: str | None = None,
+) -> os.stat_result:
     with preview_lock:
+        if expected_version is not None and (
+            path.is_symlink()
+            or get_preview_version(path.stat()) != expected_version
+        ):
+            raise ValueError(
+                "Файл змінився. Скасувати попереднє обертання неможливо."
+            )
         remove_scan_previews(path)
         with Image.open(path) as image:
             rotated_image = image.rotate(-degrees, expand=True)
@@ -652,10 +676,20 @@ def rotate_image_file(path: Path, degrees: int = 90) -> None:
                 rotated_image = rotated_image.convert("RGB")
 
             rotated_image.save(path)
+        return path.stat()
 
 
-def rotate_pdf_file(path: Path, degrees: int = 90) -> None:
+def rotate_pdf_file(
+    path: Path, degrees: int = 90, *, expected_version: str | None = None,
+) -> os.stat_result:
     with preview_lock:
+        if expected_version is not None and (
+            path.is_symlink()
+            or get_preview_version(path.stat()) != expected_version
+        ):
+            raise ValueError(
+                "Файл змінився. Скасувати попереднє обертання неможливо."
+            )
         with NamedTemporaryFile(
             dir=path.parent, suffix=".tmp", delete=False
         ) as temporary_file:
@@ -677,6 +711,7 @@ def rotate_pdf_file(path: Path, degrees: int = 90) -> None:
             temporary_path.replace(path)
         finally:
             temporary_path.unlink(missing_ok=True)
+        return path.stat()
 
 
 def apply_scan_rotation(path: Path, rotation: str) -> None:
@@ -893,19 +928,44 @@ def rotate_scan(filename: str) -> str | Response:
             message="Файл не знайдено або ім'я файлу некоректне.",
             message_type="error",
         )
+    direction = request.form.get("direction", "clockwise")
+    reverting = direction == "counterclockwise"
+    expected_version = (
+        request.form.get("expected_version") if reverting else None
+    )
+    if direction not in {"clockwise", "counterclockwise"} or (
+        reverting and not expected_version
+    ):
+        return scan_action_response(
+            message="Некоректний запит обертання.", message_type="error"
+        )
     try:
+        degrees = -90 if reverting else 90
         if requested_path.suffix.lower() == ".pdf":
-            rotate_pdf_file(requested_path)
+            stat = rotate_pdf_file(
+                requested_path, degrees, expected_version=expected_version
+            )
         else:
-            rotate_image_file(requested_path)
+            stat = rotate_image_file(
+                requested_path, degrees, expected_version=expected_version
+            )
     except (OSError, ValueError, pdfium.PdfiumError) as error:
         return scan_action_response(
             message=f"Не вдалося повернути файл: {error}", message_type="error"
         )
 
+    revert = None if reverting else dict(
+        url=url_for("rotate_scan", filename=requested_path.name),
+        fields=dict(
+            direction="counterclockwise",
+            expected_version=get_preview_version(stat),
+        ),
+        file_id=requested_path.name,
+    )
     return scan_action_response(
-        message="Файл повернуто на 90°.", filename=requested_path.name,
-        rotated_path=requested_path,
+        message="Дію скасовано." if reverting else "Файл повернуто на 90°.",
+        filename=requested_path.name, rotated_path=requested_path,
+        rotated_stat=stat, revert=revert,
     )
 
 
@@ -954,7 +1014,17 @@ def delete_scan(filename: str) -> Response:
         return redirect_to_scan_list(destination)
 
     flash("Файл переміщено в кошик. Його можна відновити.", "success")
-    return redirect_to_scan_list(destination)
+    return redirect_to_scan_list(
+        destination,
+        revert=dict(
+            url=url_for(
+                "restore_trash", entry_id=directory.name, return_to="scans",
+                page=max(1, request.args.get("page", 1, type=int)),
+                per_page=per_page,
+            ),
+            fields={}, file_id=requested_path.name,
+        ),
+    )
 
 
 @app.route("/trash")
@@ -1000,14 +1070,20 @@ def restore_trash(entry_id: str) -> Response:
             result = get_trash_file(entry_id)
             if result is None:
                 flash("Файл у кошику не знайдено.", "error")
-                return redirect_to_trash()
-            path, _ = result
-            destination = SCAN_DIR / path.name
-            # A hard link preserves metadata and cannot overwrite an existing name.
-            os.link(path, destination)
-            path.unlink()
-            remove_trash_previews(path, entry_id)
-            path.parent.rmdir()
+            else:
+                path, _ = result
+                destination = SCAN_DIR / path.name
+                # Preserve metadata without overwriting an existing name.
+                os.link(path, destination)
+                path.unlink()
+                remove_trash_previews(path, entry_id)
+                path.parent.rmdir()
+                flash(
+                    "Дію скасовано."
+                    if request.args.get("return_to") == "scans"
+                    else "Файл відновлено до списку сканів.",
+                    "success",
+                )
     except FileExistsError:
         flash(
             "Файл із таким ім'ям уже існує. "
@@ -1018,8 +1094,13 @@ def restore_trash(entry_id: str) -> Response:
         flash(
             f"Не вдалося завершити відновлення файлу: {error}", "error"
         )
-    else:
-        flash("Файл відновлено до списку сканів.", "success")
+    if request.args.get("return_to") == "scans":
+        context = get_scan_list_context()
+        if wants_action_json():
+            return list_action_response("index", context)
+        return redirect(url_for(
+            "index", page=context["page"], per_page=context["per_page"]
+        ))
     return redirect_to_trash()
 
 
