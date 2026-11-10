@@ -175,6 +175,11 @@ BASE_TEMPLATE = """
       color: var(--text);
     }
 
+    .back-link,
+    .back-link:hover {
+      color: var(--accent);
+    }
+
     .trash-link,
     .trash-link:hover {
       color: var(--danger-text);
@@ -1033,7 +1038,7 @@ HOME_BODY = """
 
 
 TRASH_BODY = """
-<a class="secondary-link" href="{{ url_for('index') }}">← До сканів</a>
+<a class="secondary-link back-link" href="{{ url_for('index') }}">← До сканів</a>
 <p class="hint">Файли в кошику можна відновити. Автоматичне очищення вимкнене.</p>
 {% if files %}
   <form class="trash-action" method="post" action="{{ url_for('empty_trash') }}"
