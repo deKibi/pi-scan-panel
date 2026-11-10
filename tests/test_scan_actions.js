@@ -32,6 +32,7 @@ function setup() {
     return {
       isConnected: true, disabled: false, hidden: true, dataset: {}, textContent: "",
       classList: { toggle() {}, remove() {} },
+      closest: () => null,
       setAttribute() {}, removeAttribute() {},
       focus(options) { document.activeElement = this; focusCalls.push({ target: this, options }); },
       addEventListener(name, callback) { events[name] = callback; },
@@ -136,6 +137,7 @@ function setup() {
   return {
     requests, scrolls, focusCalls, changes, elements, document, makeRow,
     get rows() { return rows; },
+    get timerCount() { return timers.size; },
     submit,
     async flush() { await Promise.all(pending.splice(0)); },
     respond(value) { response = value; },
@@ -336,4 +338,84 @@ test("a newer error notice is not hidden by a previous success timer", async () 
   assert.equal(page.elements["#action-notice"].hidden, false);
   page.advanceTime(1);
   assert.equal(page.elements["#action-notice"].hidden, true);
+});
+
+test("clicking a notice or its text dismisses it and cancels its timer without moving the page", async () => {
+  for (const success of [true, false]) {
+    const page = setup();
+    page.respond({ success, message: "Result" });
+    page.submit(page.rows[1].forms[1]);
+    await page.flush();
+    const notice = page.elements["#action-notice"];
+    const scrollCount = page.scrolls.length;
+    const focusCount = page.focusCalls.length;
+    const active = page.document.activeElement;
+    assert.equal(notice.hidden, false);
+    assert.equal(page.timerCount, 1);
+    notice.emit("click", { target: success ? notice : page.elements["#action-notice-text"] });
+    assert.equal(notice.hidden, true);
+    assert.equal(page.timerCount, 0);
+    page.advanceTime(10000);
+    assert.equal(page.scrolls.length, scrollCount);
+    assert.equal(page.focusCalls.length, focusCount);
+    assert.equal(page.document.activeElement, active);
+  }
+});
+
+test("clicking the login link leaves the notice and native link behavior intact", async () => {
+  const page = setup();
+  page.fetchWith(() => ({ status: 401 }));
+  page.submit(page.rows[1].forms[1]);
+  await page.flush();
+  const notice = page.elements["#action-notice"];
+  const link = page.elements["#action-login"];
+  link.closest = (selector) => selector === "a" ? link : null;
+  notice.emit("click", {
+    target: link,
+    preventDefault() { assert.fail("link navigation must not be prevented"); },
+    stopPropagation() { assert.fail("link clicks must propagate normally"); },
+  });
+  assert.equal(link.hidden, false);
+  assert.equal(notice.hidden, false);
+  assert.equal(page.timerCount, 1);
+});
+
+test("dismissing a pending notice does not cancel the action or hide its result", async () => {
+  const page = setup();
+  let finish;
+  page.fetchWith(() => new Promise((resolve) => { finish = resolve; }));
+  const form = page.rows[1].forms[1];
+  page.submit(form);
+  const notice = page.elements["#action-notice"];
+  notice.emit("click", { target: notice });
+  assert.equal(notice.hidden, true);
+  assert.equal(form.button.disabled, true);
+  assert.equal(page.requests.length, 1);
+  finish({ ok: true, headers: { get: () => "application/json" }, json: async () => ({ success: true, message: "Printed" }) });
+  await page.flush();
+  assert.equal(notice.hidden, false);
+  assert.equal(page.elements["#action-notice-text"].textContent, "Printed");
+  assert.equal(form.button.disabled, false);
+  page.advanceTime(5999);
+  assert.equal(notice.hidden, false);
+  page.advanceTime(1);
+  assert.equal(notice.hidden, true);
+});
+
+test("a new notice receives its full display time after dismissing the previous one", async () => {
+  const page = setup();
+  const form = page.rows[1].forms[1];
+  const notice = page.elements["#action-notice"];
+  page.submit(form);
+  await page.flush();
+  page.advanceTime(5000);
+  notice.emit("click", { target: notice });
+  page.submit(form);
+  await page.flush();
+  page.advanceTime(1000);
+  assert.equal(notice.hidden, false);
+  page.advanceTime(4999);
+  assert.equal(notice.hidden, false);
+  page.advanceTime(1);
+  assert.equal(notice.hidden, true);
 });

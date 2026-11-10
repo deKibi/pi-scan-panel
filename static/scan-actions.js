@@ -9,6 +9,12 @@
   let busy = false;
   let noticeTimer = null;
 
+  function hideNotice() {
+    clearTimeout(noticeTimer);
+    noticeTimer = null;
+    notice.hidden = true;
+  }
+
   function showNotice(message, error = false, login = false, duration = error ? 10000 : 6000) {
     clearTimeout(noticeTimer);
     noticeTimer = null;
@@ -17,12 +23,14 @@
     loginLink.hidden = !login;
     notice.hidden = false;
     if (duration > 0) {
-      noticeTimer = setTimeout(() => {
-        notice.hidden = true;
-        noticeTimer = null;
-      }, duration);
+      noticeTimer = setTimeout(hideNotice, duration);
     }
   }
+
+  notice.addEventListener("click", (event) => {
+    if (event.target.closest("a")) return;
+    hideNotice();
+  });
 
   document.addEventListener("change", (event) => {
     if (event.target.matches("#scan-per-page, #trash-per-page")) {

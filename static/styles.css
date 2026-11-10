@@ -139,6 +139,7 @@ h1 {
 }
 
 .action-notice {
+  cursor: pointer;
   position: fixed;
   z-index: 10;
   bottom: 16px;
