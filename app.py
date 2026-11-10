@@ -331,18 +331,16 @@ BASE_TEMPLATE = """
       width: 100%;
     }
 
-    .preview-placeholder {
-      font-size: 0.75rem;
-      padding: 4px;
-      text-align: center;
+    .preview-error {
+      display: none;
     }
 
     .scan-preview.is-loaded img {
       opacity: 1;
     }
 
-    .scan-preview.is-loaded .preview-placeholder {
-      visibility: hidden;
+    .scan-preview.is-error .preview-error {
+      display: block;
     }
 
     .pagination {
@@ -558,7 +556,11 @@ HOME_BODY = """
       <article class="scan-item">
         {% if file.is_image %}
           <a class="scan-preview" href="{{ file.open_url }}" target="_blank" rel="noopener">
-            <span class="preview-placeholder" aria-hidden="true">Прев’ю</span>
+            <svg class="preview-error" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+              <circle cx="8" cy="8" r="1.5"></circle>
+              <path d="m21 15-5-5L5 21M3 3l18 18"></path>
+            </svg>
             <img data-preview-src="{{ file.preview_url }}" alt="{{ file.name }}" width="96" height="120" decoding="async">
           </a>
         {% else %}
@@ -638,7 +640,9 @@ HOME_BODY = """
           if (loaded) {
             preview.classList.add("is-loaded");
           } else {
-            preview.querySelector(".preview-placeholder").textContent = "Прев’ю недоступне";
+            preview.classList.add("is-error");
+            preview.title = "Прев’ю недоступне. Відкрити оригінал.";
+            preview.setAttribute("aria-label", `${image.alt}: ${preview.title}`);
           }
           activePreviews -= 1;
           loadNextPreviews();
