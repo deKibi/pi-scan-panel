@@ -326,6 +326,10 @@ BASE_TEMPLATE = """
       margin: 14px 0 0;
     }
 
+    .trash-empty-form {
+      margin-top: 16px;
+    }
+
     .scan-status {
       color: var(--busy-text);
       font-weight: 650;
@@ -977,7 +981,7 @@ TRASH_BODY = """
 <a class="secondary-link back-link" href="{{ url_for('index') }}">← До сканів</a>
 <p class="hint">Файли в кошику можна відновити. Автоматичне очищення вимкнене.</p>
 {% if files %}
-  <form class="trash-action" method="post" action="{{ url_for('empty_trash') }}"
+  <form class="trash-action trash-empty-form" method="post" action="{{ url_for('empty_trash') }}"
         data-confirm-title="Очистити кошик?" data-confirm-action="Очистити кошик"
         data-confirm="Остаточно видалити всі файли кошика ({{ total }})? Відновити їх буде неможливо.">
     {% for entry_id in entry_ids %}
