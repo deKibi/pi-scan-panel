@@ -91,7 +91,7 @@ BASE_TEMPLATE = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }}</title>
-  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
   <style>
     :root {
       color-scheme: light;
