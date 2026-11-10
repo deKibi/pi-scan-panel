@@ -19,6 +19,9 @@ function setup() {
   const changes = [];
   const pending = [];
   const elements = {};
+  const timers = new Map();
+  let now = 0;
+  let timerId = 0;
   let rows;
   let nextRows;
   let response = { success: true, message: "Done" };
@@ -117,7 +120,13 @@ function setup() {
     FormData: class { constructor(form) { this.form = form; } },
     window: { scrollX: 0, scrollY: 750, scrollTo: (value) => scrolls.push(value) },
     history: { state: null, replaceState: (...args) => changes.push(args) },
-    lockScroll: () => () => {}, setTimeout,
+    lockScroll: () => () => {},
+    setTimeout(callback, delay) {
+      const id = ++timerId;
+      timers.set(id, { callback, deadline: now + delay });
+      return id;
+    },
+    clearTimeout(id) { timers.delete(id); },
     fetch: async (url, options) => {
       requests.push({ url, options });
       if (fetchResponse) return fetchResponse();
@@ -132,6 +141,17 @@ function setup() {
     respond(value) { response = value; },
     fetchWith(callback) { fetchResponse = callback; },
     replaceWith(value) { nextRows = value; },
+    advanceTime(milliseconds) {
+      const end = now + milliseconds;
+      while (timers.size) {
+        const [id, timer] = [...timers].sort((a, b) => a[1].deadline - b[1].deadline)[0];
+        if (timer.deadline > end) break;
+        now = timer.deadline;
+        timers.delete(id);
+        timer.callback();
+      }
+      now = end;
+    },
   };
 }
 
@@ -246,4 +266,74 @@ test("expired sessions show a login link and restore button availability", async
   assert.equal(page.elements["#action-login"].hidden, false);
   assert.equal(form.button.disabled, false);
   assert.equal(page.scrolls.length, 0);
+});
+
+test("success notices hide after six seconds without moving scroll or focus", async () => {
+  const page = setup();
+  page.submit(page.rows[1].forms[1]);
+  await page.flush();
+  const notice = page.elements["#action-notice"];
+  const scrollCount = page.scrolls.length;
+  const focusCount = page.focusCalls.length;
+  const active = page.document.activeElement;
+  page.advanceTime(5999);
+  assert.equal(notice.hidden, false);
+  page.advanceTime(1);
+  assert.equal(notice.hidden, true);
+  assert.equal(page.scrolls.length, scrollCount);
+  assert.equal(page.focusCalls.length, focusCount);
+  assert.equal(page.document.activeElement, active);
+});
+
+test("server, network and session errors remain visible for ten seconds", async () => {
+  for (const kind of ["server", "network", "session"]) {
+    const page = setup();
+    if (kind === "server") page.respond({ success: false, message: "Print failed" });
+    if (kind === "network") page.fetchWith(() => { throw new Error("offline"); });
+    if (kind === "session") page.fetchWith(() => ({ status: 401 }));
+    page.submit(page.rows[1].forms[1]);
+    await page.flush();
+    page.advanceTime(9999);
+    assert.equal(page.elements["#action-notice"].hidden, false, kind);
+    page.advanceTime(1);
+    assert.equal(page.elements["#action-notice"].hidden, true, kind);
+  }
+});
+
+test("pending actions cancel old timers and results receive their full display time", async () => {
+  const page = setup();
+  const form = page.rows[1].forms[1];
+  page.submit(form);
+  await page.flush();
+  page.advanceTime(5000);
+  let finish;
+  page.fetchWith(() => new Promise((resolve) => { finish = resolve; }));
+  page.submit(form);
+  page.advanceTime(30000);
+  assert.equal(page.elements["#action-notice"].hidden, false);
+  assert.equal(page.elements["#action-notice-text"].textContent, "Виконуємо дію…");
+  finish({ ok: true, headers: { get: () => "application/json" }, json: async () => ({ success: true, message: "Printed" }) });
+  await page.flush();
+  page.advanceTime(5999);
+  assert.equal(page.elements["#action-notice"].hidden, false);
+  page.advanceTime(1);
+  assert.equal(page.elements["#action-notice"].hidden, true);
+});
+
+test("a newer error notice is not hidden by a previous success timer", async () => {
+  const page = setup();
+  const form = page.rows[1].forms[1];
+  page.submit(form);
+  await page.flush();
+  page.advanceTime(5000);
+  page.respond({ success: false, message: "Printer busy" });
+  page.submit(form);
+  await page.flush();
+  page.advanceTime(1000);
+  assert.equal(page.elements["#action-notice"].hidden, false);
+  assert.equal(page.elements["#action-notice-text"].textContent, "Printer busy");
+  page.advanceTime(8999);
+  assert.equal(page.elements["#action-notice"].hidden, false);
+  page.advanceTime(1);
+  assert.equal(page.elements["#action-notice"].hidden, true);
 });

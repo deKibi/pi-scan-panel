@@ -7,12 +7,21 @@
   const noticeText = document.querySelector("#action-notice-text");
   const loginLink = document.querySelector("#action-login");
   let busy = false;
+  let noticeTimer = null;
 
-  function showNotice(message, error = false, login = false) {
+  function showNotice(message, error = false, login = false, duration = error ? 10000 : 6000) {
+    clearTimeout(noticeTimer);
+    noticeTimer = null;
     noticeText.textContent = message;
     notice.classList.toggle("error", error);
     loginLink.hidden = !login;
     notice.hidden = false;
+    if (duration > 0) {
+      noticeTimer = setTimeout(() => {
+        notice.hidden = true;
+        noticeTimer = null;
+      }, duration);
+    }
   }
 
   document.addEventListener("change", (event) => {
@@ -36,7 +45,7 @@
     const buttons = [...list.querySelectorAll("button")].filter((button) => !button.disabled);
     buttons.forEach((button) => { button.disabled = true; });
     list.setAttribute("aria-busy", "true");
-    showNotice("Виконуємо дію…");
+    showNotice("Виконуємо дію…", false, false, 0);
 
     let focusTarget = submitter;
     let restoreFocus = false;
