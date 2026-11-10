@@ -194,6 +194,39 @@ BASE_TEMPLATE = """
       box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
     }
 
+    .confirm-dialog {
+      width: min(420px, calc(100% - 32px));
+      max-height: calc(100dvh - 32px);
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--text);
+      padding: 24px;
+    }
+
+    .confirm-dialog::backdrop {
+      background: rgba(15, 23, 42, 0.45);
+    }
+
+    .confirm-dialog p {
+      overflow-wrap: anywhere;
+    }
+
+    .confirm-dialog .actions {
+      justify-content: flex-end;
+    }
+
+    .confirm-dialog .cancel-button {
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    .confirm-dialog button:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
     form {
       display: grid;
       gap: 16px;
@@ -623,6 +656,100 @@ BASE_TEMPLATE = """
       {{ body|safe }}
     </section>
   </main>
+  {% if logged_in %}
+    <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+      <h2 id="confirm-title"></h2>
+      <p id="confirm-message"></p>
+      <div class="actions">
+        <button class="cancel-button" id="confirm-cancel" type="button" autofocus>Скасувати</button>
+        <button class="danger-button" id="confirm-accept" type="button"></button>
+      </div>
+    </dialog>
+    <script type="module">
+      import { lockScroll } from "{{ url_for('static', filename='scroll-lock.js') }}";
+
+      const dialog = document.querySelector("#confirm-dialog");
+      const cancelButton = document.querySelector("#confirm-cancel");
+      const acceptButton = document.querySelector("#confirm-accept");
+      const approved = new WeakSet();
+      let pending = null;
+      let unlockScroll = null;
+      let backdropPointer = false;
+
+      function finish(confirmed) {
+        if (!pending) return;
+        const { form, submitter, opener } = pending;
+        pending = null;
+        if (dialog.open) dialog.close();
+        if (unlockScroll) unlockScroll();
+        unlockScroll = null;
+        if (opener && opener.isConnected) opener.focus({ preventScroll: true });
+        if (confirmed) {
+          approved.add(form);
+          form.requestSubmit(submitter || undefined);
+        }
+      }
+
+      document.addEventListener("submit", (event) => {
+        const form = event.target;
+        if (!form.matches("form[data-confirm]")) return;
+        if (approved.has(form)) {
+          approved.delete(form);
+          return;
+        }
+        event.preventDefault();
+        if (pending) return;
+        pending = {
+          form,
+          submitter: event.submitter,
+          opener: event.submitter || document.activeElement,
+        };
+        document.querySelector("#confirm-title").textContent = form.dataset.confirmTitle;
+        document.querySelector("#confirm-message").textContent = form.dataset.confirm;
+        acceptButton.textContent = form.dataset.confirmAction;
+        try {
+          if (typeof dialog.showModal !== "function") {
+            throw new Error("Modal dialogs are unavailable");
+          }
+          unlockScroll = lockScroll();
+          dialog.showModal();
+          cancelButton.focus({ preventScroll: true });
+        } catch (error) {
+          if (dialog.open) dialog.close();
+          if (unlockScroll) unlockScroll();
+          unlockScroll = null;
+          // Only opening failures use the system confirmation.
+          const confirmed = window.confirm(form.dataset.confirm);
+          // The browser ignores reentrant submission during the original event.
+          setTimeout(() => finish(confirmed), 0);
+        }
+      }, true);
+
+      cancelButton.addEventListener("click", () => finish(false));
+      acceptButton.addEventListener("click", () => finish(true));
+      dialog.addEventListener("cancel", (event) => {
+        event.preventDefault();
+        finish(false);
+      });
+      dialog.addEventListener("close", () => {
+        if (!dialog.open && unlockScroll) finish(false);
+      });
+      function outsideDialog(event) {
+        const bounds = dialog.getBoundingClientRect();
+        return event.clientX < bounds.left || event.clientX > bounds.right
+          || event.clientY < bounds.top || event.clientY > bounds.bottom;
+      }
+      dialog.addEventListener("pointerdown", (event) => {
+        backdropPointer = event.target === dialog && outsideDialog(event);
+      });
+      dialog.addEventListener("click", (event) => {
+        if (backdropPointer && event.target === dialog && outsideDialog(event)) {
+          finish(false);
+        }
+        backdropPointer = false;
+      });
+    </script>
+  {% endif %}
 </body>
 </html>
 """
@@ -732,8 +859,10 @@ HOME_BODY = """
             <form class="action-form print-form" method="post" action="{{ file.print_url }}">
               <button type="submit">Друк</button>
             </form>
-            <form class="action-form delete-form" method="post" action="{{ file.delete_url }}">
-              <button class="danger" type="submit">У кошик</button>
+            <form class="action-form delete-form" method="post" action="{{ file.delete_url }}"
+                  data-confirm-title="Видалити файл?" data-confirm-action="Видалити"
+                  data-confirm="«{{ file.name }}» буде переміщено в кошик. Файл можна буде відновити.">
+              <button class="danger" type="submit">Видалити</button>
             </form>
           </div>
         </div>
@@ -886,14 +1015,6 @@ HOME_BODY = """
     });
   });
 
-  document.querySelectorAll(".delete-form").forEach((form) => {
-    form.addEventListener("submit", (event) => {
-      if (!confirm("Перемістити цей файл у кошик? Його можна буде відновити.")) {
-        event.preventDefault();
-      }
-    });
-  });
-
   document.querySelectorAll(".action-form:not(.print-form)").forEach((form) => {
     form.addEventListener("submit", (event) => {
       if (event.defaultPrevented) {
@@ -916,6 +1037,7 @@ TRASH_BODY = """
 <p class="hint">Файли в кошику можна відновити. Автоматичне очищення вимкнене.</p>
 {% if files %}
   <form class="trash-action" method="post" action="{{ url_for('empty_trash') }}"
+        data-confirm-title="Очистити кошик?" data-confirm-action="Очистити кошик"
         data-confirm="Остаточно видалити всі файли кошика ({{ total }})? Відновити їх буде неможливо.">
     {% for entry_id in entry_ids %}
       <input type="hidden" name="entry_id" value="{{ entry_id }}">
@@ -933,6 +1055,7 @@ TRASH_BODY = """
               <button type="submit">Відновити</button>
             </form>
             <form class="trash-action" method="post" action="{{ url_for('delete_trash', entry_id=file.id, page=page, per_page=per_page) }}"
+                  data-confirm-title="Видалити файл назавжди?" data-confirm-action="Видалити назавжди"
                   data-confirm="Видалити назавжди «{{ file.name }}»? Відновити файл буде неможливо.">
               <button class="danger" type="submit">Видалити назавжди</button>
             </form>
@@ -976,10 +1099,7 @@ TRASH_BODY = """
   }
   document.querySelectorAll(".trash-action").forEach((form) => {
     form.addEventListener("submit", (event) => {
-      if (form.dataset.confirm && !confirm(form.dataset.confirm)) {
-        event.preventDefault();
-        return;
-      }
+      if (event.defaultPrevented) return;
       form.querySelector("button[type='submit']").disabled = true;
     });
   });
