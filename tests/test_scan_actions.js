@@ -36,7 +36,11 @@ function setup() {
       setAttribute() {}, removeAttribute() {},
       focus(options) { document.activeElement = this; focusCalls.push({ target: this, options }); },
       addEventListener(name, callback) { events[name] = callback; },
-      emit(name, event = {}) { events[name]?.(event); },
+      contains(item) { return item === this; },
+      emit(name, event = {}) {
+        const result = events[name]?.(event);
+        if (result?.then) pending.push(result);
+      },
     };
   }
 
@@ -87,16 +91,18 @@ function setup() {
     },
   });
   elements["#file-list"] = list;
-  for (const id of ["action-notice", "action-notice-text", "action-login", "last-scan-actions", "file-list-heading",
+  for (const id of ["action-notice", "action-notice-text", "action-login", "action-revert", "action-close", "last-scan-actions", "file-list-heading",
                     "confirm-dialog", "confirm-cancel", "confirm-accept", "confirm-title", "confirm-message"]) {
     elements[`#${id}`] = element();
   }
+  elements["#action-notice"].contains = (item) => ["action-notice", "action-notice-text", "action-login", "action-revert", "action-close"]
+    .some((id) => elements[`#${id}`] === item);
   const dialog = elements["#confirm-dialog"];
   dialog.open = false;
   dialog.showModal = () => { dialog.open = true; };
   dialog.close = () => { dialog.open = false; dialog.emit("close"); };
   const document = {
-    body: element(), activeElement: null,
+    body: element(), activeElement: null, hidden: false,
     querySelector: (selector) => elements[selector],
     addEventListener: (name, callback, capture = false) => listeners.push({ name, callback, capture }),
     dispatchEvent: (event) => changes.push(event.type),
@@ -118,7 +124,11 @@ function setup() {
 
   vm.runInNewContext(source + "\n" + confirmation, {
     document, Event: class { constructor(type) { this.type = type; } },
-    FormData: class { constructor(form) { this.form = form; } },
+    FormData: class {
+      constructor(form) { this.form = form; this.fields = {}; }
+      append(name, value) { this.fields[name] = value; }
+    },
+    performance: { now: () => now }, queueMicrotask,
     window: { scrollX: 0, scrollY: 750, scrollTo: (value) => scrolls.push(value) },
     history: { state: null, replaceState: (...args) => changes.push(args) },
     lockScroll: () => () => {},
@@ -139,6 +149,7 @@ function setup() {
     get rows() { return rows; },
     get timerCount() { return timers.size; },
     submit,
+    emitDocument(name) { listeners.filter((item) => item.name === name).forEach((item) => item.callback({})); },
     async flush() { await Promise.all(pending.splice(0)); },
     respond(value) { response = value; },
     fetchWith(callback) { fetchResponse = callback; },
@@ -340,7 +351,7 @@ test("a newer error notice is not hidden by a previous success timer", async () 
   assert.equal(page.elements["#action-notice"].hidden, true);
 });
 
-test("clicking a notice or its text dismisses it and cancels its timer without moving the page", async () => {
+test("only the close button dismisses a notice; clicking its text leaves it available", async () => {
   for (const success of [true, false]) {
     const page = setup();
     page.respond({ success, message: "Result" });
@@ -353,6 +364,9 @@ test("clicking a notice or its text dismisses it and cancels its timer without m
     assert.equal(notice.hidden, false);
     assert.equal(page.timerCount, 1);
     notice.emit("click", { target: success ? notice : page.elements["#action-notice-text"] });
+    assert.equal(notice.hidden, false);
+    assert.equal(page.timerCount, 1);
+    page.elements["#action-close"].emit("click");
     assert.equal(notice.hidden, true);
     assert.equal(page.timerCount, 0);
     page.advanceTime(10000);
@@ -387,7 +401,7 @@ test("dismissing a pending notice does not cancel the action or hide its result"
   const form = page.rows[1].forms[1];
   page.submit(form);
   const notice = page.elements["#action-notice"];
-  notice.emit("click", { target: notice });
+  page.elements["#action-close"].emit("click");
   assert.equal(notice.hidden, true);
   assert.equal(form.button.disabled, true);
   assert.equal(page.requests.length, 1);
@@ -409,7 +423,7 @@ test("a new notice receives its full display time after dismissing the previous 
   page.submit(form);
   await page.flush();
   page.advanceTime(5000);
-  notice.emit("click", { target: notice });
+  page.elements["#action-close"].emit("click");
   page.submit(form);
   await page.flush();
   page.advanceTime(1000);
@@ -418,4 +432,162 @@ test("a new notice receives its full display time after dismissing the previous 
   assert.equal(notice.hidden, false);
   page.advanceTime(1);
   assert.equal(notice.hidden, true);
+});
+
+test("rotation Revert lasts ten seconds and sends the matching version exactly once", async () => {
+  const page = setup();
+  const row = page.rows[1];
+  const revert = {
+    url: "/rotate/second.png", file_id: "second.png",
+    fields: { direction: "counterclockwise", expected_version: "rotated-version" },
+  };
+  page.respond({ success: true, message: "Rotated", revert });
+  page.submit(row.forms[0]);
+  await page.flush();
+  const button = page.elements["#action-revert"];
+  assert.equal(button.hidden, false);
+  page.advanceTime(9999);
+  assert.equal(page.elements["#action-notice"].hidden, false);
+  page.respond({ success: true, message: "Дію скасовано.", file: { id: "second.png", metadata: "original orientation", preview_url: "/previews/second.png?v=3" } });
+  page.document.activeElement = button;
+  button.emit("click");
+  button.emit("click");
+  await page.flush();
+  assert.equal(page.requests.length, 2);
+  assert.equal(page.requests[1].url, revert.url);
+  assert.deepEqual(page.requests[1].options.body.fields, revert.fields);
+  assert.equal(row.querySelector("img[data-preview-src]").dataset.previewSrc, "/previews/second.png?v=3");
+  assert.equal(page.scrolls.at(-1).top, 750);
+  assert.equal(page.document.activeElement, row.forms[0].button);
+  assert.equal(button.hidden, true);
+  assert.equal(button.disabled, false);
+  page.advanceTime(6000);
+  assert.equal(page.elements["#action-notice"].hidden, true);
+});
+
+test("Revert expires and cannot send a request after its notice is closed or replaced", async () => {
+  for (const dismissal of ["timeout", "close", "next-action"]) {
+    const page = setup();
+    page.respond({ success: true, message: "Rotated", revert: { url: "/rotate/second.png", fields: {}, file_id: "second.png" } });
+    page.submit(page.rows[1].forms[0]);
+    await page.flush();
+    if (dismissal === "timeout") page.advanceTime(10000);
+    if (dismissal === "close") page.elements["#action-close"].emit("click");
+    if (dismissal === "next-action") {
+      page.respond({ success: false, message: "Print failed" });
+      page.submit(page.rows[1].forms[1]);
+      await page.flush();
+    }
+    const requestCount = page.requests.length;
+    assert.equal(page.elements["#action-revert"].hidden, true);
+    page.elements["#action-revert"].emit("click");
+    await page.flush();
+    assert.equal(page.requests.length, requestCount);
+  }
+});
+
+test("cancelling delete confirmation preserves the previous Revert", async () => {
+  const page = setup();
+  page.respond({ success: true, message: "Rotated", revert: { url: "/rotate/second.png", fields: {}, file_id: "second.png" } });
+  page.submit(page.rows[1].forms[0]);
+  await page.flush();
+  page.submit(page.rows[1].forms[2]);
+  page.elements["#confirm-cancel"].emit("click");
+  await page.flush();
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.elements["#action-revert"].hidden, false);
+});
+
+test("delete Revert updates the main list without navigating to trash", async () => {
+  const page = setup();
+  const first = page.makeRow("first.png", -150);
+  const third = page.makeRow("third.png", 100);
+  page.replaceWith([first, third]);
+  const revert = { url: "/trash/entry/restore?return_to=scans&page=1&per_page=10", fields: {}, file_id: "second.png" };
+  page.respond({ success: true, message: "Deleted", revert, list_html: "updated-list", page: 1, per_page: 10, url: "/?page=1&per_page=10" });
+  page.submit(page.rows[1].forms[2]);
+  page.elements["#confirm-accept"].emit("click");
+  await page.flush();
+  const second = page.makeRow("second.png", 100);
+  const restoredThird = page.makeRow("third.png", 350);
+  page.replaceWith([first, second, restoredThird]);
+  page.respond({ success: true, message: "Дію скасовано.", list_html: "updated-list", page: 1, per_page: 10, url: "/?page=1&per_page=10" });
+  page.document.activeElement = page.elements["#action-revert"];
+  page.elements["#action-revert"].emit("click");
+  await page.flush();
+  assert.equal(page.requests[1].url, revert.url);
+  assert.equal(page.rows[1], second);
+  assert.equal(page.elements["#action-revert"].hidden, true);
+  assert.ok(page.changes.filter(Array.isArray).every((change) => change[2].startsWith("/?")));
+});
+
+test("notice timeout pauses on hover, keyboard focus and hidden tabs with its remaining time", async () => {
+  for (const pause of ["hover", "focus", "background"]) {
+    const page = setup();
+    page.respond({ success: true, message: "Rotated", revert: { url: "/rotate/second.png", fields: {}, file_id: "second.png" } });
+    page.submit(page.rows[1].forms[0]);
+    await page.flush();
+    const notice = page.elements["#action-notice"];
+    page.advanceTime(3000);
+    if (pause === "hover") notice.emit("pointerenter", { pointerType: "mouse" });
+    if (pause === "focus") {
+      page.document.activeElement = page.elements["#action-revert"];
+      notice.emit("focusin");
+    }
+    if (pause === "background") {
+      page.document.hidden = true;
+      page.emitDocument("visibilitychange");
+    }
+    page.advanceTime(30000);
+    assert.equal(notice.hidden, false, pause);
+    assert.equal(page.timerCount, 0, pause);
+    if (pause === "hover") notice.emit("pointerleave");
+    if (pause === "focus") {
+      page.document.activeElement = page.rows[1].forms[0].button;
+      notice.emit("focusout", { relatedTarget: page.document.activeElement });
+      await Promise.resolve();
+    }
+    if (pause === "background") {
+      page.document.hidden = false;
+      page.emitDocument("visibilitychange");
+    }
+    page.advanceTime(6999);
+    assert.equal(notice.hidden, false, pause);
+    page.advanceTime(1);
+    assert.equal(notice.hidden, true, pause);
+  }
+});
+
+test("touch does not leave the notice timer paused after lifting the finger", async () => {
+  const page = setup();
+  page.respond({ success: true, message: "Rotated", revert: { url: "/rotate/second.png", fields: {}, file_id: "second.png" } });
+  page.submit(page.rows[1].forms[0]);
+  await page.flush();
+  const notice = page.elements["#action-notice"];
+  page.advanceTime(3000);
+  notice.emit("pointerenter", { pointerType: "touch" });
+  notice.emit("pointerdown");
+  page.advanceTime(20000);
+  notice.emit("pointerup");
+  page.advanceTime(7000);
+  assert.equal(notice.hidden, true);
+});
+
+test("Revert failures and expired sessions unlock controls without offering another Revert", async () => {
+  for (const kind of ["server", "network", "session"]) {
+    const page = setup();
+    page.respond({ success: true, message: "Rotated", revert: { url: "/rotate/second.png", fields: {}, file_id: "second.png" } });
+    page.submit(page.rows[1].forms[0]);
+    await page.flush();
+    if (kind === "server") page.respond({ success: false, message: "File changed" });
+    if (kind === "network") page.fetchWith(() => { throw new Error("offline"); });
+    if (kind === "session") page.fetchWith(() => ({ status: 401 }));
+    page.elements["#action-revert"].emit("click");
+    await page.flush();
+    assert.equal(page.requests.length, 2, kind);
+    assert.equal(page.elements["#action-revert"].hidden, true, kind);
+    assert.equal(page.elements["#action-revert"].disabled, false, kind);
+    assert.ok(page.rows.every((row) => row.forms.every((form) => !form.button.disabled)), kind);
+    assert.equal(page.elements["#action-login"].hidden, kind !== "session", kind);
+  }
 });

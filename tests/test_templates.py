@@ -91,6 +91,10 @@ class TemplateTests(unittest.TestCase):
         self.assertIn('/static/scroll-lock.js', html)
         self.assertIn('id="confirm-dialog"', html)
         self.assertIn('href="/logout"', html)
+        self.assertIn('id="action-revert"', html)
+        self.assertIn('id="action-close"', html)
+        self.assertIn('aria-label="Revert — скасувати останню дію"', html)
+        self.assertIn('id="action-notice-text" role="status"', html)
 
     def test_empty_trash_uses_base_layout(self) -> None:
         self.authenticate()

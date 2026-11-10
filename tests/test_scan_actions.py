@@ -80,6 +80,98 @@ class ScanActionTests(unittest.TestCase):
         self.assertEqual(data["file"]["id"], "scan-0.png")
         self.assertNotIn("list_html", data)
 
+    def test_rotation_revert_restores_orientation_once(self) -> None:
+        for extension in ("png", "jpg", "jpeg", "pdf"):
+            with self.subTest(extension=extension):
+                name = f"scan.{extension}"
+                path = (
+                    self.pdf(name) if extension == "pdf" else self.image(name)
+                )
+                if extension != "pdf":
+                    with Image.new("RGB", (40, 60), "white") as image:
+                        image.paste("red", (0, 0, 20, 30))
+                        image.save(path)
+                data = self.post(f"/rotate/{name}")
+                revert = data["revert"]
+                self.assertEqual(revert["file_id"], name)
+                self.assertEqual(
+                    revert["fields"]["direction"], "counterclockwise"
+                )
+                reverted = self.post(revert["url"], data=revert["fields"])
+                self.assertTrue(reverted["success"])
+                self.assertEqual(reverted["message"], "Дію скасовано.")
+                self.assertNotIn("revert", reverted)
+                self.assertNotIn("list_html", reverted)
+                self.assertNotEqual(
+                    data["file"]["preview_url"],
+                    reverted["file"]["preview_url"],
+                )
+                if extension == "pdf":
+                    with pdfium.PdfDocument(path) as document:
+                        for index in range(len(document)):
+                            page = document[index]
+                            try:
+                                self.assertEqual(
+                                    page.get_rotation(), index * 90
+                                )
+                            finally:
+                                page.close()
+                else:
+                    with Image.open(path) as image:
+                        self.assertEqual(image.size, (40, 60))
+                        red, green, blue = image.getpixel((5, 5))
+                        self.assertGreater(red, green + 100)
+                        self.assertGreater(red, blue + 100)
+                        self.assertGreater(min(image.getpixel((35, 55))), 200)
+                original = path.read_bytes()
+                repeated = self.post(revert["url"], data=revert["fields"])
+                self.assertFalse(repeated["success"])
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_old_revert_preserves_newer_or_replaced_file(self) -> None:
+        for extension in ("png", "pdf"):
+            with self.subTest(extension=extension):
+                name = f"scan.{extension}"
+                path = (
+                    self.pdf(name) if extension == "pdf" else self.image(name)
+                )
+                first = self.post(f"/rotate/{name}")["revert"]
+                second = self.post(f"/rotate/{name}")["revert"]
+                original = path.read_bytes()
+                self.assertFalse(
+                    self.post(first["url"], data=first["fields"])["success"]
+                )
+                self.assertEqual(path.read_bytes(), original)
+                path.unlink()
+                if extension == "pdf":
+                    self.pdf(name)
+                else:
+                    self.image(name)
+                replacement = path.read_bytes()
+                self.assertFalse(
+                    self.post(second["url"], data=second["fields"])["success"]
+                )
+                self.assertEqual(path.read_bytes(), replacement)
+
+    def test_rotation_revert_validates_version_and_missing_file(self) -> None:
+        path = self.image()
+        original = path.read_bytes()
+        for fields in (
+            {"direction": "counterclockwise"},
+            {"direction": "counterclockwise", "expected_version": ""},
+            {"direction": "invalid"},
+        ):
+            with self.subTest(fields=fields):
+                data = self.post("/rotate/scan.png", data=fields)
+                self.assertFalse(data["success"])
+                self.assertNotIn("revert", data)
+                self.assertEqual(path.read_bytes(), original)
+        revert = self.post("/rotate/scan.png")["revert"]
+        path.unlink()
+        self.assertFalse(
+            self.post(revert["url"], data=revert["fields"])["success"]
+        )
+
     def test_pdf_rotation_updates_every_page_and_preview_url(self) -> None:
         path = self.pdf()
         urls = []
@@ -213,6 +305,64 @@ class ScanActionTests(unittest.TestCase):
         self.assertTrue(data["success"])
         self.assertIn("Кошик порожній.", data["list_html"])
         self.assertTrue((self.scan_dir / "scan.png").is_file())
+
+    def test_delete_revert_restores_entry_and_original_page(self) -> None:
+        for index in range(11):
+            path = self.image(f"scan-{index}.png")
+            os.utime(path, (1000 + index, 1000 + index))
+        path = self.scan_dir / "scan-0.png"
+        original = path.read_bytes()
+        deleted = self.post("/delete/scan-0.png?page=2&per_page=10")
+        self.assertEqual(deleted["page"], 1)
+        revert = deleted["revert"]
+        self.assertEqual(revert["file_id"], path.name)
+        restored = self.post(revert["url"], data=revert["fields"])
+        self.assertTrue(restored["success"])
+        self.assertNotIn("revert", restored)
+        self.assertEqual(restored["message"], "Дію скасовано.")
+        self.assertEqual(restored["url"], "/?page=2&per_page=10")
+        self.assertIn('data-file-id="scan-0.png"', restored["list_html"])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(list(panel.get_trash_dir().iterdir()), [])
+        repeated = self.post(revert["url"], data=revert["fields"])
+        self.assertFalse(repeated["success"])
+        self.assertIn('data-file-id="scan-0.png"', repeated["list_html"])
+
+    def test_delete_revert_keeps_other_entry_with_same_filename(self) -> None:
+        path = self.image()
+        first_revert = self.post("/delete/scan.png")["revert"]
+        with Image.new("RGB", (60, 40), "red") as image:
+            image.save(path)
+        original = path.read_bytes()
+        second_revert = self.post("/delete/scan.png")["revert"]
+        restored = self.post(
+            second_revert["url"], data=second_revert["fields"]
+        )
+        self.assertTrue(restored["success"])
+        self.assertEqual(path.read_bytes(), original)
+        conflict = self.post(first_revert["url"], data=first_revert["fields"])
+        self.assertFalse(conflict["success"])
+        self.assertNotIn("revert", conflict)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(len(list(panel.get_trash_dir().iterdir())), 1)
+
+    def test_expired_session_revert_preserves_files(self) -> None:
+        path = self.image()
+        rotation = self.post("/rotate/scan.png")["revert"]
+        original = path.read_bytes()
+        self.image("other.png")
+        deletion = self.post("/delete/other.png")["revert"]
+        with self.client.session_transaction() as session:
+            session.clear()
+        for revert in (rotation, deletion):
+            response = self.client.post(
+                revert["url"], data=revert["fields"],
+                headers={"Accept": "application/json"},
+            )
+            self.assertEqual(response.status_code, 401)
+            self.assertNotIn("revert", response.get_json())
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse((self.scan_dir / "other.png").exists())
 
     def test_permanent_delete_and_empty_keep_confirmed_snapshot(self) -> None:
         self.image()
