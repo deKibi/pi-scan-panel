@@ -1,0 +1,69 @@
+{% if files %}
+  <form class="trash-action trash-empty-form" method="post" action="{{ url_for('empty_trash', page=page, per_page=per_page) }}"
+        data-confirm-title="Очистити кошик?" data-confirm-action="Очистити кошик"
+        data-confirm="Остаточно видалити всі файли кошика ({{ total }})? Відновити їх буде неможливо.">
+    {% for entry_id in entry_ids %}
+      <input type="hidden" name="entry_id" value="{{ entry_id }}">
+    {% endfor %}
+    <button class="danger-button" type="submit">Очистити кошик ({{ total }})</button>
+  </form>
+  <div class="scan-list">
+    {% for file in files %}
+      <article class="scan-item" data-file-id="{{ file.id }}">
+        {% if file.preview_url %}
+          <div class="scan-preview{% if not file.is_image %} pdf-preview{% endif %}">
+            <svg class="preview-error" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+              <circle cx="8" cy="8" r="1.5"></circle>
+              <path d="m21 15-5-5L5 21M3 3l18 18"></path>
+            </svg>
+            <img data-preview-src="{{ file.preview_url }}" alt="{{ file.name }}" width="96" height="120" decoding="async">
+          </div>
+        {% else %}
+          <div class="scan-preview pdf-preview">PDF</div>
+        {% endif %}
+        <div class="scan-meta">
+          <strong>{{ file.name }}</strong>
+          <span>{{ file.size }} · У кошику з {{ file.deleted_at }}</span>
+          <div class="scan-actions">
+            <form class="trash-action" method="post" action="{{ url_for('restore_trash', entry_id=file.id, page=page, per_page=per_page) }}">
+              <button type="submit">Відновити</button>
+            </form>
+            <form class="trash-action" method="post" action="{{ url_for('delete_trash', entry_id=file.id, page=page, per_page=per_page) }}"
+                  data-confirm-title="Видалити файл назавжди?" data-confirm-action="Видалити назавжди"
+                  data-confirm="Видалити назавжди «{{ file.name }}»? Відновити файл буде неможливо.">
+              <button class="danger" type="submit">Видалити назавжди</button>
+            </form>
+          </div>
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+  <nav class="pagination" aria-label="Сторінки кошика">
+    <div class="pagination-controls">
+      {% if page > 1 %}
+        <a class="pagination-link pagination-previous" href="{{ url_for('trash', page=page - 1, per_page=per_page) }}" aria-label="Попередня сторінка">‹</a>
+      {% endif %}
+      <form class="pagination-page" method="get" action="{{ url_for('trash') }}">
+        <input type="hidden" name="per_page" value="{{ per_page }}">
+        <input name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" required aria-label="Номер сторінки" style="width: {{ (page_count|string|length) + 5 }}ch">
+        <span>/ {{ page_count }}</span>
+      </form>
+      {% if page < page_count %}
+        <a class="pagination-link pagination-next" href="{{ url_for('trash', page=page + 1, per_page=per_page) }}" aria-label="Наступна сторінка">›</a>
+      {% endif %}
+    </div>
+    <form class="pagination-size" method="get" action="{{ url_for('trash') }}">
+      <label for="trash-per-page">На сторінці:</label>
+      <select id="trash-per-page" name="per_page">
+        {% for size in page_sizes %}
+          <option value="{{ size }}" {% if size == per_page %}selected{% endif %}>{{ size }}</option>
+        {% endfor %}
+      </select>
+    </form>
+  </nav>
+{% elif unavailable %}
+  <p class="hint">Список кошика недоступний.</p>
+{% else %}
+  <p class="hint">Кошик порожній.</p>
+{% endif %}

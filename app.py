@@ -21,6 +21,7 @@ from flask import (
     Flask,
     Response,
     flash,
+    get_flashed_messages,
     jsonify,
     redirect,
     render_template,
@@ -115,6 +116,14 @@ def login_required(view: Any) -> Any:
     @wraps(view)
     def wrapped_view(*args: Any, **kwargs: Any) -> Any:
         if not session.get("logged_in"):
+            if (
+                request.method == "POST" and wants_action_json()
+                and request.endpoint in {
+                    "rotate_scan", "print_scan", "delete_scan", "restore_trash",
+                    "delete_trash", "empty_trash",
+                }
+            ):
+                return jsonify(success=False, message="Сесію завершено."), 401
             return redirect(url_for("login"))
 
         return view(*args, **kwargs)
@@ -269,6 +278,8 @@ def list_trash_files() -> list[dict[str, Any]]:
 
 
 def redirect_to_trash() -> Response:
+    if wants_action_json():
+        return list_action_response("trash", get_trash_list_context())
     per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
     if per_page not in SCAN_PAGE_SIZES:
         per_page = SCAN_FILES_PER_PAGE
@@ -279,6 +290,108 @@ def redirect_to_trash() -> Response:
             per_page=per_page,
         )
     )
+
+
+def wants_action_json() -> bool:
+    return request.accept_mimetypes.best == "application/json"
+
+
+def get_scan_list_context() -> dict[str, Any]:
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    files, page, page_count = list_scan_files(
+        request.args.get("page", 1, type=int), per_page
+    )
+    return dict(
+        scan_files=files, page=page, page_count=page_count,
+        per_page=per_page, page_sizes=SCAN_PAGE_SIZES,
+    )
+
+
+def get_trash_list_context() -> dict[str, Any]:
+    message = None
+    try:
+        files = list_trash_files()
+    except OSError as error:
+        files = []
+        message = f"Не вдалося прочитати кошик: {error}"
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    page_count = max(1, (len(files) + per_page - 1) // per_page)
+    page = min(max(1, request.args.get("page", 1, type=int)), page_count)
+    offset = (page - 1) * per_page
+    return dict(
+        files=files[offset:offset + per_page],
+        entry_ids=[file["id"] for file in files], total=len(files),
+        unavailable=message is not None, message=message,
+        page=page, page_count=page_count, per_page=per_page,
+        page_sizes=SCAN_PAGE_SIZES,
+    )
+
+
+def list_action_response(endpoint: str, context: dict[str, Any]) -> Response:
+    messages = get_flashed_messages(with_categories=True)
+    message_type, message = messages[-1]
+    if context.get("unavailable"):
+        return jsonify(
+            success=False, message=f"{message} {context['message']}",
+            message_type="error",
+        )
+    payload = dict(
+        success=message_type == "success", message=message,
+        message_type=message_type,
+        list_html=render_template(
+            "_trash_list.html" if endpoint == "trash" else "_scan_list.html",
+            **context,
+        ),
+        page=context["page"], per_page=context["per_page"],
+        url=url_for(
+            endpoint, page=context["page"], per_page=context["per_page"]
+        ),
+    )
+    if endpoint == "index":
+        payload["last_scan_html"] = render_template(
+            "_last_scan.html",
+            filename=last_scan["filename"] if last_scan else None,
+        )
+    return jsonify(payload)
+
+
+def redirect_to_scan_list(destination: str) -> Response:
+    if wants_action_json():
+        return list_action_response("index", get_scan_list_context())
+    return redirect(destination)
+
+
+def scan_action_response(
+    message: str, message_type: str = "success", filename: str | None = None,
+    *, rotated_path: Path | None = None,
+) -> str | Response:
+    if not wants_action_json():
+        return render_home(
+            message=message, message_type=message_type, filename=filename
+        )
+    payload = dict(
+        success=message_type == "success", message=message,
+        message_type=message_type,
+    )
+    if rotated_path is not None:
+        stat = rotated_path.stat()
+        completed_at = datetime.fromtimestamp(stat.st_mtime, tz=KYIV_TIMEZONE)
+        payload["file"] = dict(
+            id=rotated_path.name,
+            preview_url=url_for(
+                "preview_scan", filename=rotated_path.name,
+                v=get_preview_version(stat),
+            ),
+            metadata=(
+                f"{completed_at:%Y-%m-%d %H:%M:%S}"
+                f" · {format_file_size(stat.st_size)}"
+            ),
+        )
+    return jsonify(payload)
 
 
 def list_scan_files(
@@ -597,12 +710,7 @@ def render_home(
     message_type: str = "success",
     filename: str | None = None,
 ) -> str:
-    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
-    if per_page not in SCAN_PAGE_SIZES:
-        per_page = SCAN_FILES_PER_PAGE
-    scan_files, page, page_count = list_scan_files(
-        request.args.get("page", 1, type=int), per_page
-    )
+    context = get_scan_list_context()
     return render_page(
         title="Pi Scan Panel",
         heading="Pi Scan Panel",
@@ -623,11 +731,7 @@ def render_home(
         },
         busy=command_lock.locked(),
         filename=filename,
-        scan_files=scan_files,
-        page=page,
-        page_count=page_count,
-        per_page=per_page,
-        page_sizes=SCAN_PAGE_SIZES,
+        **context,
     )
 
 
@@ -755,20 +859,31 @@ def printer_status() -> Response:
 
 @app.route("/rotate/<path:filename>", methods=["POST"])
 @login_required
-def rotate_scan(filename: str) -> str:
+def rotate_scan(filename: str) -> str | Response:
     requested_path = get_safe_scan_path(filename)
 
     if requested_path is None:
-        return render_home(message="Файл не знайдено або ім'я файлу некоректне.", message_type="error")
+        return scan_action_response(
+            message="Файл не знайдено або ім'я файлу некоректне.",
+            message_type="error",
+        )
     if requested_path.suffix.lower() not in IMAGE_FILE_EXTENSIONS:
-        return render_home(message="Поворот доступний тільки для PNG або JPG.", message_type="error")
+        return scan_action_response(
+            message="Поворот доступний тільки для PNG або JPG.",
+            message_type="error",
+        )
 
     try:
         rotate_image_file(requested_path)
     except OSError as error:
-        return render_home(message=f"Не вдалося повернути файл: {error}", message_type="error")
+        return scan_action_response(
+            message=f"Не вдалося повернути файл: {error}", message_type="error"
+        )
 
-    return render_home(message="Файл повернуто на 90°.", message_type="success", filename=requested_path.name)
+    return scan_action_response(
+        message="Файл повернуто на 90°.", filename=requested_path.name,
+        rotated_path=requested_path,
+    )
 
 
 @app.route("/delete/<path:filename>", methods=["POST"])
@@ -791,7 +906,7 @@ def delete_scan(filename: str) -> Response:
                 flash(
                     "Файл не знайдено або ім'я файлу некоректне.", "error"
                 )
-                return redirect(destination)
+                return redirect_to_scan_list(destination)
             timestamp = datetime.now(timezone.utc).strftime(
                 "%Y%m%dT%H%M%S%fZ"
             )
@@ -813,41 +928,22 @@ def delete_scan(filename: str) -> Response:
                 )
     except OSError as error:
         flash(f"Не вдалося перемістити файл у кошик: {error}", "error")
-        return redirect(destination)
+        return redirect_to_scan_list(destination)
 
     flash("Файл переміщено в кошик. Його можна відновити.", "success")
-    return redirect(destination)
+    return redirect_to_scan_list(destination)
 
 
 @app.route("/trash")
 @login_required
 def trash() -> str:
-    message = None
-    try:
-        files = list_trash_files()
-    except OSError as error:
-        files = []
-        message = f"Не вдалося прочитати кошик: {error}"
-    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
-    if per_page not in SCAN_PAGE_SIZES:
-        per_page = SCAN_FILES_PER_PAGE
-    page_count = max(1, (len(files) + per_page - 1) // per_page)
-    page = min(max(1, request.args.get("page", 1, type=int)), page_count)
-    offset = (page - 1) * per_page
+    context = get_trash_list_context()
     return render_page(
         title="Кошик — Pi Scan Panel",
         heading="Кошик",
         body_template="trash.html",
-        message=message,
         message_type="error",
-        files=files[offset:offset + per_page],
-        entry_ids=[file["id"] for file in files],
-        total=len(files),
-        unavailable=message is not None,
-        page=page,
-        page_count=page_count,
-        per_page=per_page,
-        page_sizes=SCAN_PAGE_SIZES,
+        **context,
     )
 
 
@@ -957,16 +1053,23 @@ def empty_trash() -> Response:
 
 @app.route("/print/<path:filename>", methods=["POST"])
 @login_required
-def print_scan(filename: str) -> str:
+def print_scan(filename: str) -> str | Response:
     requested_path = get_safe_scan_path(filename)
 
     if requested_path is None:
-        return render_home(message="Файл не знайдено або ім'я файлу некоректне.", message_type="error")
+        return scan_action_response(
+            message="Файл не знайдено або ім'я файлу некоректне.",
+            message_type="error",
+        )
     if requested_path.suffix.lower() not in PRINT_FILE_EXTENSIONS:
-        return render_home(message="Цей формат не підтримується для друку.", message_type="error")
+        return scan_action_response(
+            message="Цей формат не підтримується для друку.", message_type="error"
+        )
 
     message, message_type = print_file_with_lock(requested_path)
-    return render_home(message=message, message_type=message_type, filename=requested_path.name)
+    return scan_action_response(
+        message=message, message_type=message_type, filename=requested_path.name
+    )
 
 
 @app.route("/print-upload", methods=["POST"])
