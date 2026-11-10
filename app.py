@@ -43,6 +43,7 @@ DEFAULT_UPLOAD_DIR = "/home/pi/scans/uploads"
 SCAN_TIMEOUT_SECONDS = 900
 PRINT_TIMEOUT_SECONDS = 60
 SCAN_FILES_PER_PAGE = 20
+SCAN_PAGE_SIZES = (10, 20, 50)
 PREVIEW_MAX_SIZE = (640, 640)
 PREVIEW_JPEG_QUALITY = 85
 # Bump this when preview dimensions or encoding settings change.
@@ -346,24 +347,24 @@ BASE_TEMPLATE = """
     .pagination {
       align-items: center;
       display: grid;
-      gap: 12px;
-      grid-template-areas: "previous page next";
-      grid-template-columns: 124px max-content 124px;
+      gap: 8px;
+      grid-template-areas: "previous page next size";
+      grid-template-columns: 44px max-content 44px max-content;
       justify-content: center;
       margin-top: 18px;
     }
 
     .pagination-link {
       align-items: center;
-      background: #ffffff;
-      border: 1px solid var(--border);
+      background: transparent;
+      border: 1px solid transparent;
       border-radius: 8px;
       color: var(--text);
       display: flex;
-      font-weight: 650;
+      font-size: 1.5rem;
       justify-content: center;
       min-height: 42px;
-      padding: 9px 13px;
+      padding: 4px;
       text-decoration: none;
     }
 
@@ -373,8 +374,8 @@ BASE_TEMPLATE = """
     }
 
     .pagination-link[aria-disabled="true"] {
-      background: #f9fafb;
       color: var(--muted);
+      opacity: 0.45;
     }
 
     .pagination-previous {
@@ -395,20 +396,35 @@ BASE_TEMPLATE = """
       white-space: nowrap;
     }
 
-    .pagination-page label {
-      color: var(--text);
+    .pagination-size {
+      align-items: center;
+      display: flex;
+      gap: 8px;
+      grid-area: size;
+      justify-self: center;
+      margin-left: 12px;
+      white-space: nowrap;
+    }
+
+    .pagination-size label {
       display: inline;
       font: inherit;
     }
 
-    .pagination-page input {
+    .pagination-page input,
+    .pagination-size select {
       min-height: 42px;
       padding: 8px;
+      width: auto;
+    }
+
+    .pagination-page input {
       text-align: center;
     }
 
     .pagination-link:focus-visible,
-    .pagination-page input:focus-visible {
+    .pagination-page input:focus-visible,
+    .pagination-size select:focus-visible {
       outline: 2px solid var(--accent);
       outline-offset: 2px;
     }
@@ -516,8 +532,12 @@ BASE_TEMPLATE = """
       }
 
       .pagination {
-        grid-template-areas: "page page" "previous next";
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-areas: "previous page next" "size size size";
+        grid-template-columns: 44px max-content 44px;
+      }
+
+      .pagination-size {
+        margin-left: 0;
       }
     }
   </style>
@@ -654,29 +674,43 @@ HOME_BODY = """
       </article>
     {% endfor %}
   </div>
-  {% if page_count > 1 %}
     <nav class="pagination" aria-label="Сторінки сканів">
       {% if page > 1 %}
-        <a class="pagination-link pagination-previous" href="{{ url_for('index', page=page - 1) }}">Попередня</a>
+        <a class="pagination-link pagination-previous" href="{{ url_for('index', page=page - 1, per_page=per_page) }}" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></a>
       {% else %}
-        <span class="pagination-link pagination-previous" role="link" aria-disabled="true">Попередня</span>
+        <span class="pagination-link pagination-previous" role="link" aria-disabled="true" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></span>
       {% endif %}
       <form class="pagination-page" method="get" action="{{ url_for('index') }}">
-        <label for="scan-page">Сторінка</label>
-        <input id="scan-page" name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" step="1" required inputmode="numeric" aria-describedby="pagination-total" title="Введіть номер сторінки та натисніть Enter" style="width: {{ (page_count|string|length) + 7 }}ch">
-        <span id="pagination-total">з {{ page_count }}</span>
+        <input type="hidden" name="per_page" value="{{ per_page }}">
+        <input id="scan-page" name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" step="1" required inputmode="numeric" aria-label="Номер сторінки" aria-describedby="pagination-total" title="Введіть номер сторінки та натисніть Enter" style="width: {{ (page_count|string|length) + 5 }}ch">
+        <span id="pagination-total">/ {{ page_count }}</span>
       </form>
       {% if page < page_count %}
-        <a class="pagination-link pagination-next" href="{{ url_for('index', page=page + 1) }}">Наступна</a>
+        <a class="pagination-link pagination-next" href="{{ url_for('index', page=page + 1, per_page=per_page) }}" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></a>
       {% else %}
-        <span class="pagination-link pagination-next" role="link" aria-disabled="true">Наступна</span>
+        <span class="pagination-link pagination-next" role="link" aria-disabled="true" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></span>
       {% endif %}
+      <form class="pagination-size" method="get" action="{{ url_for('index') }}">
+        <input type="hidden" name="page" value="1">
+        <label for="scan-per-page">На сторінці:</label>
+        <select id="scan-per-page" name="per_page">
+          {% for size in page_sizes %}
+            <option value="{{ size }}" {% if size == per_page %}selected{% endif %}>{{ size }}</option>
+          {% endfor %}
+        </select>
+      </form>
     </nav>
-  {% endif %}
 {% else %}
   <p class="hint">Поки немає збережених сканів.</p>
 {% endif %}
 <script>
+  const pageSizeSelect = document.querySelector("#scan-per-page");
+  if (pageSizeSelect) {
+    pageSizeSelect.addEventListener("change", () => {
+      pageSizeSelect.form.requestSubmit();
+    });
+  }
+
   // Start image requests after the document loads so previews do not hold up the page.
   window.addEventListener("load", () => {
     const previewQueue = new Set();
@@ -921,7 +955,9 @@ def get_preview_version(stat: os.stat_result) -> str:
     )
 
 
-def list_scan_files(page: int = 1) -> tuple[list[dict[str, Any]], int, int]:
+def list_scan_files(
+    page: int = 1, per_page: int = SCAN_FILES_PER_PAGE
+) -> tuple[list[dict[str, Any]], int, int]:
     if not SCAN_DIR.is_dir():
         return [], 1, 1
 
@@ -932,11 +968,11 @@ def list_scan_files(page: int = 1) -> tuple[list[dict[str, Any]], int, int]:
                 scan_paths.append((Path(entry.path), entry.stat()))
 
     scan_paths.sort(key=lambda item: item[1].st_mtime_ns, reverse=True)
-    page_count = max(1, (len(scan_paths) + SCAN_FILES_PER_PAGE - 1) // SCAN_FILES_PER_PAGE)
+    page_count = max(1, (len(scan_paths) + per_page - 1) // per_page)
     page = min(max(1, page), page_count)
-    offset = (page - 1) * SCAN_FILES_PER_PAGE
+    offset = (page - 1) * per_page
     files: list[dict[str, Any]] = []
-    for path, stat in scan_paths[offset:offset + SCAN_FILES_PER_PAGE]:
+    for path, stat in scan_paths[offset:offset + per_page]:
         suffix = path.suffix.lower()
         completed_at = datetime.fromtimestamp(stat.st_mtime, tz=KYIV_TIMEZONE)
         files.append(
@@ -956,9 +992,15 @@ def list_scan_files(page: int = 1) -> tuple[list[dict[str, Any]], int, int]:
                     ) if suffix in IMAGE_FILE_EXTENSIONS else None
                 ),
                 "download_url": url_for("download_scan", filename=path.name),
-                "rotate_url": url_for("rotate_scan", filename=path.name, page=page),
-                "print_url": url_for("print_scan", filename=path.name, page=page),
-                "delete_url": url_for("delete_scan", filename=path.name, page=page),
+                "rotate_url": url_for(
+                    "rotate_scan", filename=path.name, page=page, per_page=per_page
+                ),
+                "print_url": url_for(
+                    "print_scan", filename=path.name, page=page, per_page=per_page
+                ),
+                "delete_url": url_for(
+                    "delete_scan", filename=path.name, page=page, per_page=per_page
+                ),
             }
         )
 
@@ -1184,7 +1226,12 @@ def render_home(
     message_type: str = "success",
     filename: str | None = None,
 ) -> str:
-    scan_files, page, page_count = list_scan_files(request.args.get("page", 1, type=int))
+    per_page = request.args.get("per_page", SCAN_FILES_PER_PAGE, type=int)
+    if per_page not in SCAN_PAGE_SIZES:
+        per_page = SCAN_FILES_PER_PAGE
+    scan_files, page, page_count = list_scan_files(
+        request.args.get("page", 1, type=int), per_page
+    )
     return render_page(
         title="Pi Scan Panel",
         heading="Pi Scan Panel",
@@ -1208,6 +1255,8 @@ def render_home(
         scan_files=scan_files,
         page=page,
         page_count=page_count,
+        per_page=per_page,
+        page_sizes=SCAN_PAGE_SIZES,
     )
 
 
