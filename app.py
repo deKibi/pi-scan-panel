@@ -662,6 +662,7 @@ BASE_TEMPLATE = """
     </section>
   </main>
   {% if logged_in %}
+    <script src="{{ url_for('static', filename='scan-previews.js') }}" defer></script>
     <dialog class="confirm-dialog" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
       <h2 id="confirm-title"></h2>
       <p id="confirm-message"></p>
@@ -913,72 +914,7 @@ HOME_BODY = """
     });
   }
 
-  // Start image requests after the document loads so previews do not hold up the page.
   window.addEventListener("load", () => {
-    const previewQueue = new Set();
-    const previewMargin = 200;
-    const maxActivePreviews = 2;
-    let activePreviews = 0;
-
-    function loadNextPreviews() {
-      const candidates = [...previewQueue].map((image) => {
-        const bounds = image.getBoundingClientRect();
-        return {
-          image,
-          top: bounds.top,
-          bottom: bounds.bottom,
-          visible: bounds.bottom > 0 && bounds.top < window.innerHeight,
-        };
-      }).filter((item) => (
-        item.bottom >= -previewMargin && item.top <= window.innerHeight + previewMargin
-      )).sort((first, second) => (
-        Number(second.visible) - Number(first.visible) || first.top - second.top
-      ));
-
-      for (const { image, visible } of candidates) {
-        if (activePreviews >= maxActivePreviews) {
-          break;
-        }
-
-        previewQueue.delete(image);
-        previewObserver.unobserve(image);
-        activePreviews += 1;
-        image.fetchPriority = visible ? "high" : "low";
-
-        function finishPreview(loaded) {
-          const preview = image.closest(".scan-preview");
-          if (loaded) {
-            preview.classList.add("is-loaded");
-          } else {
-            preview.classList.add("is-error");
-            preview.title = "Прев’ю недоступне. Відкрити оригінал.";
-            preview.setAttribute("aria-label", `${image.alt}: ${preview.title}`);
-          }
-          activePreviews -= 1;
-          loadNextPreviews();
-        }
-
-        image.addEventListener("load", () => finishPreview(true), { once: true });
-        image.addEventListener("error", () => finishPreview(false), { once: true });
-        image.src = image.dataset.previewSrc;
-      }
-    }
-
-    const previewObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (entry.isIntersecting) {
-          previewQueue.add(entry.target);
-        } else {
-          previewQueue.delete(entry.target);
-        }
-      }
-      loadNextPreviews();
-    }, { rootMargin: `${previewMargin}px 0px` });
-
-    document.querySelectorAll("img[data-preview-src]").forEach((image) => {
-      previewObserver.observe(image);
-    });
-
     const printerStatus = document.querySelector("#printer-status");
     fetch(printerStatus.dataset.statusUrl, { cache: "no-store" })
       .then((response) => {
@@ -1051,7 +987,19 @@ TRASH_BODY = """
   </form>
   <div class="scan-list">
     {% for file in files %}
-      <article class="scan-item" style="grid-template-columns: minmax(0, 1fr)">
+      <article class="scan-item">
+        {% if file.is_image %}
+          <div class="scan-preview">
+            <svg class="preview-error" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+              <circle cx="8" cy="8" r="1.5"></circle>
+              <path d="m21 15-5-5L5 21M3 3l18 18"></path>
+            </svg>
+            <img data-preview-src="{{ file.preview_url }}" alt="{{ file.name }}" width="96" height="120" decoding="async">
+          </div>
+        {% else %}
+          <div class="scan-preview pdf-preview">PDF</div>
+        {% endif %}
         <div class="scan-meta">
           <strong>{{ file.name }}</strong>
           <span>{{ file.size }} · У кошику з {{ file.deleted_at }}</span>
@@ -1266,11 +1214,19 @@ def list_trash_files() -> list[dict[str, Any]]:
         if result is None:
             continue
         path, deleted_at = result
+        stat = path.stat()
         files.append(
             {
                 "id": entry.name,
                 "name": path.name,
-                "size": format_file_size(path.stat().st_size),
+                "size": format_file_size(stat.st_size),
+                "is_image": path.suffix.lower() in IMAGE_FILE_EXTENSIONS,
+                "preview_url": (
+                    url_for(
+                        "preview_trash", entry_id=entry.name,
+                        v=get_preview_version(stat),
+                    ) if path.suffix.lower() in IMAGE_FILE_EXTENSIONS else None
+                ),
                 "deleted_at": deleted_at.astimezone(KYIV_TIMEZONE).strftime(
                     "%Y-%m-%d %H:%M:%S"
                 ),
@@ -1344,10 +1300,22 @@ def list_scan_files(
     return files, page, page_count
 
 
-def remove_scan_previews(path: Path) -> None:
-    preview_dir = SCAN_DIR / "previews" / path.name
-    if preview_dir.parent.is_symlink() or preview_dir.is_symlink():
+def get_preview_dir(path: Path, trash_id: str | None = None) -> Path:
+    directory = SCAN_DIR / "previews"
+    directories = [directory]
+    if trash_id is not None:
+        if not re.fullmatch(r"[0-9]{8}T[0-9]{12}Z-[0-9a-f]{16}", trash_id):
+            raise ValueError("Invalid trash ID")
+        directories.extend([directory / "trash", directory / "trash" / trash_id])
+    else:
+        directories.append(directory / path.name)
+    if any(item.is_symlink() for item in directories):
         raise OSError("Папка прев'ю не може бути символічним посиланням.")
+    return directories[-1]
+
+
+def remove_scan_previews(path: Path, *, trash_id: str | None = None) -> None:
+    preview_dir = get_preview_dir(path, trash_id)
     if not preview_dir.is_dir():
         return
 
@@ -1356,11 +1324,18 @@ def remove_scan_previews(path: Path) -> None:
     preview_dir.rmdir()
 
 
-def get_scan_preview(path: Path) -> Path:
+def remove_trash_previews(path: Path, entry_id: str) -> None:
+    try:
+        remove_scan_previews(path, trash_id=entry_id)
+    except OSError:
+        app.logger.exception("Trash action completed, but preview cleanup failed")
+
+
+def get_scan_preview(path: Path, *, trash_id: str | None = None) -> Path:
     # Serializing generation bounds memory use when decoding large scans on the Pi.
     with preview_lock:
         stat = path.stat()
-        preview_dir = SCAN_DIR / "previews" / path.name
+        preview_dir = get_preview_dir(path, trash_id)
         preview_path = preview_dir / f"{get_preview_version(stat)}.jpg"
         if preview_path.is_file():
             return preview_path
@@ -1817,6 +1792,25 @@ def trash() -> str:
     )
 
 
+@app.route("/trash/<entry_id>/preview")
+@login_required
+def preview_trash(entry_id: str) -> Response:
+    try:
+        result = get_trash_file(entry_id)
+        if result is None or result[0].suffix.lower() not in IMAGE_FILE_EXTENSIONS:
+            return Response("Preview not found", status=404)
+        preview_path = get_scan_preview(result[0], trash_id=entry_id)
+    except FileNotFoundError:
+        return Response("Preview not found", status=404)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        app.logger.exception("Could not generate trash preview")
+        return Response("Preview unavailable", status=500)
+
+    response = send_from_directory(preview_path.parent, preview_path.name, max_age=0)
+    response.cache_control.private = True
+    return response
+
+
 @app.route("/trash/<entry_id>/restore", methods=["POST"])
 @login_required
 def restore_trash(entry_id: str) -> Response:
@@ -1831,6 +1825,7 @@ def restore_trash(entry_id: str) -> Response:
             # A hard link preserves metadata and cannot overwrite an existing name.
             os.link(path, destination)
             path.unlink()
+            remove_trash_previews(path, entry_id)
             path.parent.rmdir()
     except FileExistsError:
         flash(
@@ -1858,6 +1853,7 @@ def delete_trash(entry_id: str) -> Response:
                 return redirect_to_trash()
             path, _ = result
             path.unlink()
+            remove_trash_previews(path, entry_id)
             path.parent.rmdir()
     except OSError as error:
         flash(f"Не вдалося завершити видалення файлу: {error}", "error")
@@ -1881,6 +1877,7 @@ def empty_trash() -> Response:
                 path, _ = result
                 path.unlink()
                 deleted += 1
+                remove_trash_previews(path, entry_id)
                 path.parent.rmdir()
             except OSError:
                 failed += 1
