@@ -1,11 +1,15 @@
 // Start image requests after the document loads so previews do not hold up the page.
 window.addEventListener("load", () => {
   const previewQueue = new Set();
+  const observed = new Set();
   const previewMargin = 200;
   const maxActivePreviews = 2;
   let activePreviews = 0;
 
   function loadNextPreviews() {
+    for (const image of previewQueue) {
+      if (!image.isConnected) previewQueue.delete(image);
+    }
     const candidates = [...previewQueue].map((image) => {
       const bounds = image.getBoundingClientRect();
       return {
@@ -62,8 +66,22 @@ window.addEventListener("load", () => {
     loadNextPreviews();
   }, { rootMargin: `${previewMargin}px 0px` });
 
-  document.querySelectorAll("img[data-preview-src]").forEach((image) => {
-    previewObserver.observe(image);
-  });
+  function observePreviews() {
+    for (const image of observed) {
+      if (!image.isConnected) {
+        previewObserver.unobserve(image);
+        previewQueue.delete(image);
+        observed.delete(image);
+      }
+    }
+    document.querySelectorAll("img[data-preview-src]").forEach((image) => {
+      if (observed.has(image)) return;
+      observed.add(image);
+      previewObserver.observe(image);
+    });
+  }
+
+  document.addEventListener("scan-previews:update", observePreviews);
+  observePreviews();
 
 }, { once: true });

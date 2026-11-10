@@ -13,6 +13,7 @@ const source = fs.readFileSync(
 function setup(tops) {
   let onLoad;
   let observer;
+  let onUpdate;
   const requests = [];
   const images = tops.map((top, index) => {
     const listeners = {};
@@ -24,6 +25,7 @@ function setup(tops) {
       setAttribute: (name, value) => { attributes[name] = value; },
     };
     return {
+      isConnected: true,
       top,
       alt: `scan-${index}`,
       dataset: { previewSrc: `/previews/scan-${index}.${index % 2 ? "png" : "pdf"}` },
@@ -44,7 +46,13 @@ function setup(tops) {
         onLoad = callback;
       },
     },
-    document: { querySelectorAll: () => images },
+    document: {
+      querySelectorAll: () => images.filter((image) => image.isConnected),
+      addEventListener: (name, callback) => {
+        assert.equal(name, "scan-previews:update");
+        onUpdate = callback;
+      },
+    },
     IntersectionObserver: class {
       constructor(callback, options) {
         this.callback = callback;
@@ -60,6 +68,7 @@ function setup(tops) {
     images,
     requests,
     load() { onLoad(); },
+    update() { onUpdate(); },
     intersect(entries = images.map((target) => ({ target, isIntersecting: true }))) {
       observer.callback(entries);
     },
@@ -119,4 +128,28 @@ test("scrolling away removes a queued preview and errors do not trigger retries"
   page.images[1].finish("load");
   assert.equal(page.requests.length, 2);
   assert.match(page.images[0].attributes["aria-label"], /Відкрити оригінал/);
+});
+
+test("new previews join the shared queue and detached queued images are discarded", () => {
+  const page = setup([0, 150, 300, 450]);
+  page.load();
+  page.intersect();
+  const removed = page.images[2];
+  removed.isConnected = false;
+  const added = {
+    ...removed, isConnected: true,
+    dataset: { previewSrc: "/previews/new.png?v=2" },
+    set src(value) { page.requests.push(value); },
+  };
+  page.images.push(added);
+  page.update();
+  assert.ok(!page.observer.observed.has(removed));
+  assert.ok(page.observer.observed.has(added));
+  page.intersect([{ target: added, isIntersecting: true }]);
+  assert.equal(page.requests.length, 2);
+  page.images[0].finish("load");
+  assert.equal(page.requests[2], added.dataset.previewSrc);
+  assert.ok(!page.requests.includes(removed.dataset.previewSrc));
+  page.update();
+  assert.ok(!page.observer.observed.has(page.images[0]));
 });

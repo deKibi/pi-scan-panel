@@ -49,97 +49,17 @@
   </button>
   <p class="scan-status" id="scan-status" aria-live="polite"></p>
 </form>
-{% if filename %}
-  <div class="actions">
-    <a class="button-link" href="{{ url_for('open_scan', filename=filename) }}" target="_blank" rel="noopener">Відкрити останній скан</a>
-    <a class="button-link" href="{{ url_for('download_scan', filename=filename) }}">Завантажити останній скан</a>
-  </div>
-{% endif %}
+<div id="last-scan-actions">{% include "_last_scan.html" %}</div>
 <p class="hint">A4, область сканування 210 × 297 мм. Файли зберігаються локально на Raspberry Pi.</p>
 <div class="printer-status" id="printer-status" data-status-url="{{ url_for('printer_status') }}" aria-live="polite">Завантажуємо статус принтера...</div>
 <div class="scan-list-heading">
-  <h2>Скани</h2>
+  <h2 id="file-list-heading" tabindex="-1">Скани</h2>
   <a class="secondary-link trash-link" href="{{ url_for('trash') }}">Кошик</a>
 </div>
-{% if scan_files %}
-  <div class="scan-list">
-    {% for file in scan_files %}
-      <article class="scan-item">
-        {% if file.preview_url %}
-          <a class="scan-preview{% if not file.is_image %} pdf-preview{% endif %}" href="{{ file.open_url }}" target="_blank" rel="noopener">
-            <svg class="preview-error" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
-              <rect x="3" y="3" width="18" height="18" rx="2"></rect>
-              <circle cx="8" cy="8" r="1.5"></circle>
-              <path d="m21 15-5-5L5 21M3 3l18 18"></path>
-            </svg>
-            <img data-preview-src="{{ file.preview_url }}" alt="{{ file.name }}" width="96" height="120" decoding="async">
-          </a>
-        {% else %}
-          <a class="scan-preview pdf-preview" href="{{ file.open_url }}" target="_blank" rel="noopener">PDF</a>
-        {% endif %}
-        <div class="scan-meta">
-          <strong>{{ file.name }}</strong>
-          <span>{{ file.completed_at }} · {{ file.size }}</span>
-          <div class="scan-actions">
-            <a href="{{ file.open_url }}" target="_blank" rel="noopener">Відкрити</a>
-            <a href="{{ file.download_url }}">Завантажити</a>
-            {% if file.can_rotate %}
-              <form class="action-form" method="post" action="{{ file.rotate_url }}">
-                <button type="submit">Повернути 90°</button>
-              </form>
-            {% endif %}
-            <form class="action-form print-form" method="post" action="{{ file.print_url }}">
-              <button type="submit">Друк</button>
-            </form>
-            <form class="action-form delete-form" method="post" action="{{ file.delete_url }}"
-                  data-confirm-title="Видалити файл?" data-confirm-action="Видалити"
-                  data-confirm="«{{ file.name }}» буде переміщено в кошик. Файл можна буде відновити.">
-              <button class="danger" type="submit">Видалити</button>
-            </form>
-          </div>
-        </div>
-      </article>
-    {% endfor %}
-  </div>
-    <nav class="pagination" aria-label="Сторінки сканів">
-      <div class="pagination-controls">
-        {% if page > 1 %}
-          <a class="pagination-link pagination-previous" href="{{ url_for('index', page=page - 1, per_page=per_page) }}" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></a>
-        {% else %}
-          <span class="pagination-link pagination-previous" role="link" aria-disabled="true" aria-label="Попередня сторінка" title="Попередня сторінка"><span aria-hidden="true">‹</span></span>
-        {% endif %}
-        <form class="pagination-page" method="get" action="{{ url_for('index') }}">
-          <input type="hidden" name="per_page" value="{{ per_page }}">
-          <input id="scan-page" name="page" type="number" value="{{ page }}" min="1" max="{{ page_count }}" step="1" required inputmode="numeric" aria-label="Номер сторінки" aria-describedby="pagination-total" title="Введіть номер сторінки та натисніть Enter" style="width: {{ (page_count|string|length) + 5 }}ch">
-          <span id="pagination-total">/ {{ page_count }}</span>
-        </form>
-        {% if page < page_count %}
-          <a class="pagination-link pagination-next" href="{{ url_for('index', page=page + 1, per_page=per_page) }}" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></a>
-        {% else %}
-          <span class="pagination-link pagination-next" role="link" aria-disabled="true" aria-label="Наступна сторінка" title="Наступна сторінка"><span aria-hidden="true">›</span></span>
-        {% endif %}
-      </div>
-      <form class="pagination-size" method="get" action="{{ url_for('index') }}">
-        <input type="hidden" name="page" value="1">
-        <label for="scan-per-page">На сторінці:</label>
-        <select id="scan-per-page" name="per_page">
-          {% for size in page_sizes %}
-            <option value="{{ size }}" {% if size == per_page %}selected{% endif %}>{{ size }}</option>
-          {% endfor %}
-        </select>
-      </form>
-    </nav>
-{% else %}
-  <p class="hint">Поки немає збережених сканів.</p>
-{% endif %}
+<div id="file-list" data-page="{{ page }}" data-per-page="{{ per_page }}">
+  {% include "_scan_list.html" %}
+</div>
 <script>
-  const pageSizeSelect = document.querySelector("#scan-per-page");
-  if (pageSizeSelect) {
-    pageSizeSelect.addEventListener("change", () => {
-      pageSizeSelect.form.requestSubmit();
-    });
-  }
-
   window.addEventListener("load", () => {
     const printerStatus = document.querySelector("#printer-status");
     fetch(printerStatus.dataset.statusUrl, { cache: "no-store" })
@@ -167,33 +87,5 @@
     scanStatus.textContent = "Сканер почав роботу. Не закривайте сторінку до завершення.";
   });
 
-  document.querySelectorAll(".print-form").forEach((form) => {
-    form.addEventListener("submit", () => {
-      const button = form.querySelector("button[type='submit']");
-      const status = form.querySelector(".print-status");
-
-      if (button) {
-        button.disabled = true;
-        button.textContent = "Відправляємо на друк...";
-      }
-      if (status) {
-        status.textContent = "Файл передається у чергу друку.";
-      }
-    });
-  });
-
-  document.querySelectorAll(".action-form:not(.print-form)").forEach((form) => {
-    form.addEventListener("submit", (event) => {
-      if (event.defaultPrevented) {
-        return;
-      }
-
-      const button = form.querySelector("button[type='submit']");
-
-      if (button) {
-        button.disabled = true;
-      }
-    });
-  });
 </script>
 {% endblock %}
